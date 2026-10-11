@@ -1,0 +1,31 @@
+{
+  "name": "whatsapp-mysql-archive",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Captura local de conversaciones individuales de WhatsApp en MySQL mediante Baileys",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "migrate": "tsx src/migrate.ts",
+    "stats": "tsx src/stats.ts",
+    "test": "tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@hapi/boom": "10.0.1",
+    "@whiskeysockets/baileys": "6.7.24",
+    "dotenv": "16.4.7",
+    "luxon": "3.7.2",
+    "mysql2": "3.24.5",
+    "pino": "9.6.0",
+    "qrcode-terminal": "0.12.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.13.4",
+    "@types/luxon": "3.7.6",
+    "@types/qrcode-terminal": "0.12.2",
+    "@types/ws": "8.5.14",
+    "tsx": "4.19.3",
+    "typescript": "5.7.3"
+  }
+}
