@@ -25,6 +25,9 @@ function decrypt(value: unknown): unknown {
   }
 }
 
+export function encryptLocalValue(value:string):string { return encrypt(value) as string }
+export function decryptLocalValue(value:string):string { return decrypt(value) as string }
+
 export function encryptAppSettings<T extends object>(settings: T): T {
   const result = { ...settings } as unknown as Record<string, unknown>
   for (const field of encryptedFields) result[field] = encrypt(result[field])

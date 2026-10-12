@@ -8,6 +8,26 @@ export interface AppointmentSchedule {
   durationMinutes: number
 }
 
+export type AppointmentTextResolution =
+  | { status:'none' }
+  | { status:'missing_time'; message:string }
+  | { status:'ambiguous_time'; message:string }
+  | { status:'resolved'; localStart:string }
+
+export function resolveRelativeAppointmentText(text:string,schedule:AppointmentSchedule,now=DateTime.now().setZone(schedule.timeZone)):AppointmentTextResolution{
+  const normalized=text.normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase()
+  const relativeDay=normalized.match(/\b(hoy|manana)\b/)?.[1]
+  if(!relativeDay)return {status:'none'}
+  const time=normalized.match(/\b(?:a\s+las?\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/)
+  if(!time)return {status:'missing_time',message:'Indica también una hora para la cita.'}
+  let hour=Number(time[1]);const minute=Number(time[2]??0);const meridiem=time[3]
+  if(hour>23||minute>59)return {status:'ambiguous_time',message:'La hora indicada no es válida.'}
+  if(!meridiem&&hour>=1&&hour<=12)return {status:'ambiguous_time',message:`¿Te refieres a las ${hour}:${String(minute).padStart(2,'0')} a. m. o p. m.?`}
+  if(meridiem){if(hour<1||hour>12)return {status:'ambiguous_time',message:'Usa una hora de 1 a 12 con a. m. o p. m.'};if(meridiem==='pm'&&hour<12)hour+=12;if(meridiem==='am'&&hour===12)hour=0}
+  const day=relativeDay==='manana'?now.plus({days:1}):now
+  return {status:'resolved',localStart:day.set({hour,minute,second:0,millisecond:0}).toFormat("yyyy-MM-dd'T'HH:mm")}
+}
+
 export function resolveAppointmentStart(localStart: string, schedule: AppointmentSchedule, now = DateTime.now().setZone(schedule.timeZone)): DateTime {
   if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(localStart)) throw new Error('Indica fecha y hora como AAAA-MM-DD HH:mm')
   const start = DateTime.fromFormat(localStart, "yyyy-MM-dd'T'HH:mm", { zone: schedule.timeZone, setZone: true })

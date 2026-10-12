@@ -15,6 +15,8 @@ npm run dev
 
 `npm run dev` abre el panel en `http://127.0.0.1:3000`. El servicio de WhatsApp no comienza hasta pulsar **Iniciar servicio WhatsApp**; el QR aparece en la terminal. La sesión se conserva en la carpeta indicada por `AUTH_DIR`. **Salir de la sesión** desvincula y elimina las credenciales locales.
 
+La interfaz fuente vive en `web/` con HTML semántico y módulos ES. Tailwind CSS 4 se compila localmente: `npm run dev` inicia el servidor y el watcher de estilos; `npm run build` genera los assets en `dist/public`, servidos por `npm start`.
+
 Para compilar y ejecutar:
 
 ```sh
@@ -32,7 +34,7 @@ npm audit
 
 La migración inicial crea `whatsapp_local`. `.env.example` contiene el formato de configuración; crea `.env` local con credenciales propias. `.env`, `auth/`, `data/`, `dist/` y `node_modules/` están excluidos de Git.
 
-## Panel de configuración y administración
+## Dashboard y administración
 
 - **Identidad:** nombre del bot y del negocio. En respuestas fijas puedes usar `{botName}` y `{businessName}`.
 - **IA:** DeepSeek opcional, modelo, tono, longitud, instrucciones del negocio, máximo de respuestas por contacto/hora y pausa antes de contestar.
@@ -48,6 +50,8 @@ La API key de DeepSeek y los datos bancarios se cifran con AES-GCM en `data/app-
 
 Las respuestas automáticas solo procesan mensajes nuevos de chats individuales: no responden historial, grupos, estados ni mensajes propios. Un carrito no reserva existencias ni cobra. Las citas se almacenan en UTC y se comprueba que no haya traslapes. Las imágenes se obtienen de URLs HTTPS cuando se envían por WhatsApp; no se suben al servidor.
 
+Las decisiones de DeepSeek son propuestas. Las confirmaciones de carrito y citas se construyen después de validar y ejecutar la operación en MySQL. Las citas requieren selección/confirmación y los ajustes guardados se aplican a los mensajes siguientes sin reiniciar WhatsApp. Los mensajes de un mismo chat se procesan en orden; chats distintos pueden procesarse en paralelo.
+
 ## MySQL
 
 Las migraciones numeradas están en `migrations/` y se pueden volver a ejecutar con `npm run migrate`:
@@ -58,6 +62,7 @@ Las migraciones numeradas están en `migrations/` y se pueden volver a ejecutar 
 - `006_appointments.sql`: citas.
 - `007_admin_tools.sql`: pausas de IA y pedidos.
 - `008_contact_profiles.sql`: nombres visibles, etiquetas y notas de contactos.
+- `009_conversation_engine.sql`: idempotencia de turnos, resultados de envío e intenciones pendientes.
 
 Solo se resuelven teléfonos a partir de JID telefónicos o correspondencias PN-LID reales de WhatsApp. Los dígitos de un LID no se convierten en teléfono. Los ejemplos demo de inventario comienzan inactivos.
 

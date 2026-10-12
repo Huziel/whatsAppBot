@@ -11,6 +11,7 @@ export class PersistentQueue {
   private closed = false
   private fileOperations: Promise<void> = Promise.resolve()
   private retryTimer: NodeJS.Timeout | undefined
+  private suppressedJids = new Set<string>()
   constructor(file = './data/pending-operations.jsonl') { this.file = path.resolve(file) }
 
   async initialize(): Promise<void> {
@@ -21,6 +22,7 @@ export class PersistentQueue {
     } catch (error: any) { if (error.code !== 'ENOENT') throw error }
   }
   async enqueue(kind: Operation['kind'], data: any): Promise<void> {
+    if(typeof data?.jid==='string'&&this.suppressedJids.has(data.jid))return
     const op = { id: `${Date.now()}-${Math.random().toString(36).slice(2)}`, kind, data }
     await this.withFileLock(() => fs.appendFile(this.file, `${JSON.stringify(op, BufferJSON.replacer)}\n`, 'utf8'))
     this.pending.push(op)
@@ -58,6 +60,14 @@ export class PersistentQueue {
     } finally { this.running = false }
   }
   async close(): Promise<void> { this.closed = true; if (this.retryTimer) clearTimeout(this.retryTimer); if (!this.running) return; while (this.running) await new Promise(resolve => setTimeout(resolve, 50)) }
+  async suppressAndDiscard(jids:string[]):Promise<void>{
+    for(const jid of jids)this.suppressedJids.add(jid)
+    while(this.running)await new Promise(resolve=>setTimeout(resolve,25))
+    const blocked=new Set(jids)
+    this.pending=this.pending.filter(operation=>!blocked.has(operation.data?.jid))
+    await this.withFileLock(()=>this.rewrite())
+  }
+  releaseJids(jids:string[]):void{for(const jid of jids)this.suppressedJids.delete(jid)}
   count(): number { return this.pending.length }
   private async rewrite(): Promise<void> {
     const temp = `${this.file}.tmp`

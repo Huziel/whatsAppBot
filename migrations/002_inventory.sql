@@ -1,5 +1,3 @@
-USE whatsapp_local;
-
 CREATE TABLE IF NOT EXISTS inventory_items (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
   item_type ENUM('product','service') NOT NULL,

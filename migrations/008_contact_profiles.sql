@@ -1,5 +1,3 @@
-USE whatsapp_local;
-
 CREATE TABLE IF NOT EXISTS contact_profiles (
   contact_id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
   custom_name VARCHAR(160) NULL,

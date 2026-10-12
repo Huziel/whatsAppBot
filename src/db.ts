@@ -3,6 +3,8 @@ import { BufferJSON } from '@whiskeysockets/baileys'
 import { config } from './config'
 import { Identity, resolveIdentity } from './identity'
 import { logger } from './logger'
+import type { PendingIntentRecord, VerifiedResult } from './conversation-flow'
+import { decryptLocalValue, encryptLocalValue } from './settings-crypto'
 
 export const pool: Pool = mysql.createPool({ ...config.db, waitForConnections: true, connectionLimit: 8, queueLimit: 0, charset: 'utf8mb4', timezone: 'Z', dateStrings: false })
 pool.on('connection', connection => { connection.query("SET time_zone = '+00:00'") })
@@ -24,6 +26,8 @@ export interface CartChange { sku: string; quantity: number }
 export type CartAction = 'add' | 'remove' | 'clear' | 'show' | 'none'
 export interface AppointmentRecord { id: number; startsAt: Date; endsAt: Date; serviceRequested: string | null }
 export interface StoredConversationEntry { id: string; role: 'user' | 'assistant'; content: string; timestampMs: number }
+export type ConversationTurnStatus = 'received'|'processing'|'action_applied'|'send_pending'|'sent'|'failed'|'uncertain'
+export interface ConversationTurnRecord { id: number; jid: string; waMessageId: string; status: ConversationTurnStatus; settingsVersion: number; outcomeKind: string | null; outboundText: string | null; outboundMessageId: string | null; sendAttempts: number }
 
 const inventoryColumns = 'id,item_type AS itemType,sku,name,description,image_url AS imageUrl,price,currency,stock_quantity AS stockQuantity,is_active AS isActive'
 
@@ -34,6 +38,15 @@ function inventoryRow(row: any): InventoryItem {
 export async function listInventoryItems(): Promise<InventoryItem[]> {
   const [rows]: any = await pool.query(`SELECT ${inventoryColumns} FROM inventory_items ORDER BY item_type,name`)
   return rows.map(inventoryRow)
+}
+
+export async function getDashboardStats(): Promise<{ contacts: number; unresolvedIdentities: number; chats: number; messages: number }> {
+  const [[row]]: any = await pool.query(`SELECT
+    (SELECT COUNT(*) FROM contacts) AS contacts,
+    (SELECT COUNT(*) FROM contacts WHERE identity_status='unresolved') AS unresolvedIdentities,
+    (SELECT COUNT(*) FROM chats) AS chats,
+    (SELECT COUNT(*) FROM messages) AS messages`)
+  return { contacts: Number(row.contacts), unresolvedIdentities: Number(row.unresolvedIdentities), chats: Number(row.chats), messages: Number(row.messages) }
 }
 
 export async function listActiveInventory(limit: number | null = 40): Promise<InventoryItem[]> {
@@ -69,17 +82,28 @@ export async function getShoppingCart(jid: string): Promise<CartLine[]> {
   return rows.map((row: any) => ({ ...row, quantity: Number(row.quantity) }))
 }
 
-export async function applyShoppingCartAction(jid: string, action: CartAction, items: CartChange[]): Promise<CartLine[]> {
+export async function applyShoppingCartAction(jid: string, action: CartAction, items: CartChange[], effectKey?: string): Promise<CartLine[]> {
   if (action === 'none') return getShoppingCart(jid)
   if (action === 'show') return getShoppingCart(jid)
   await upsertContactChat(jid)
   const conn = await pool.getConnection()
   try {
     await conn.beginTransaction()
+    if (effectKey) {
+      const [[stored]]: any = await conn.execute('SELECT result_json AS resultJson FROM conversation_effects WHERE effect_key=? FOR UPDATE', [effectKey])
+      if (stored) {
+        const result = typeof stored.resultJson === 'string' ? JSON.parse(stored.resultJson) : stored.resultJson
+        await conn.commit()
+        return result.cart
+      }
+    }
     const [[contact]]: any = await conn.query('SELECT c.id FROM contacts c JOIN contact_identifiers i ON i.contact_id=c.id WHERE i.jid=? LIMIT 1 FOR UPDATE', [jid])
     if (!contact) throw new Error('No se pudo asociar el carrito al contacto')
     await conn.query('INSERT INTO shopping_carts (contact_id) VALUES (?) ON DUPLICATE KEY UPDATE contact_id=VALUES(contact_id)', [contact.id])
     const [[cart]]: any = await conn.query('SELECT id FROM shopping_carts WHERE contact_id=? FOR UPDATE', [contact.id])
+    const [beforeRows]:any=await conn.query(`SELECT sku,item_type AS itemType,item_name AS itemName,quantity,unit_price AS unitPrice,currency
+      FROM shopping_cart_items WHERE cart_id=? ORDER BY item_name FOR UPDATE`,[cart.id])
+    const beforeCart=beforeRows.map((row:any)=>({...row,quantity:Number(row.quantity)}))
     if (action === 'clear') await conn.query('DELETE FROM shopping_cart_items WHERE cart_id=?', [cart.id])
     if (action === 'remove') {
       for (const item of items) if (typeof item.sku === 'string') await conn.query('DELETE FROM shopping_cart_items WHERE cart_id=? AND sku=?', [cart.id, item.sku])
@@ -101,9 +125,26 @@ export async function applyShoppingCartAction(jid: string, action: CartAction, i
     }
     const [rows]: any = await conn.query(`SELECT sku,item_type AS itemType,item_name AS itemName,quantity,unit_price AS unitPrice,currency
       FROM shopping_cart_items WHERE cart_id=? ORDER BY item_name`, [cart.id])
+    const resultCart = rows.map((row: any) => ({ ...row, quantity: Number(row.quantity) }))
+    const changed=JSON.stringify(beforeCart)!==JSON.stringify(resultCart)
+    if (effectKey) await conn.execute('INSERT INTO conversation_effects (effect_key,effect_type,result_json) VALUES (?,?,?)', [effectKey,`cart:${action}`,JSON.stringify({ cart:resultCart,changed })])
     await conn.commit()
-    return rows.map((row: any) => ({ ...row, quantity: Number(row.quantity) }))
+    return resultCart
   } catch (error) { await conn.rollback(); throw error } finally { conn.release() }
+}
+
+export async function applyShoppingCartActionVerified(jid: string, action: CartAction, items: CartChange[], effectKey: string): Promise<VerifiedResult<{ cart: CartLine[]; changed: boolean }>> {
+  try {
+    const [[stored]]: any = await pool.execute('SELECT result_json AS resultJson FROM conversation_effects WHERE effect_key=?',[effectKey])
+    if(stored){const value=typeof stored.resultJson==='string'?JSON.parse(stored.resultJson):stored.resultJson;return value.changed?{status:'success',value:{cart:value.cart,changed:true}}:{status:'rejected',message:'No se pudo aplicar el cambio solicitado al carrito.'}}
+    const before = await getShoppingCart(jid)
+    const cart = await applyShoppingCartAction(jid,action,items,effectKey)
+    const changed = action === 'show' || JSON.stringify(before) !== JSON.stringify(cart)
+    if (!changed) return { status:'rejected', message:'No se pudo aplicar el cambio solicitado al carrito.' }
+    return { status:'success', value:{ cart, changed } }
+  } catch {
+    return { status:'infrastructure_error', message:'No pude completar la operación del carrito. Inténtalo nuevamente.' }
+  }
 }
 
 export async function getUpcomingAppointments(jid: string): Promise<AppointmentRecord[]> {
@@ -114,25 +155,41 @@ export async function getUpcomingAppointments(jid: string): Promise<AppointmentR
   return rows.map((row: any) => ({ ...row, id: Number(row.id) }))
 }
 
-export async function createAppointment(jid: string, startsAt: Date, endsAt: Date, serviceRequested: string | null): Promise<{ booked: boolean; appointment?: AppointmentRecord }> {
+export async function createAppointment(jid: string, startsAt: Date, endsAt: Date, serviceRequested: string | null, effectKey?: string): Promise<{ booked: boolean; appointment?: AppointmentRecord }> {
   await upsertContactChat(jid)
   const conn = await pool.getConnection()
   let lockAcquired = false
   try {
-    await conn.beginTransaction()
-    const [[lock]]: any = await conn.query('SELECT GET_LOCK(?,10) AS acquired', ['whatsapp-appointment-booking'])
+    const [[lock]]: any = await conn.query('SELECT GET_LOCK(?,10) AS acquired', [`whatsapp-appointment-booking:${config.db.database}`])
     if (Number(lock.acquired) !== 1) throw new Error('No se pudo bloquear agenda para validar disponibilidad')
     lockAcquired = true
+    await conn.beginTransaction()
+    if (effectKey) {
+      const [[stored]]: any = await conn.execute('SELECT result_json AS resultJson FROM conversation_effects WHERE effect_key=? FOR UPDATE', [effectKey])
+      if (stored) {
+        const value = typeof stored.resultJson === 'string' ? JSON.parse(stored.resultJson) : stored.resultJson
+        if (value.appointment) { value.appointment.startsAt = new Date(value.appointment.startsAt); value.appointment.endsAt = new Date(value.appointment.endsAt) }
+        await conn.commit()
+        return value
+      }
+    }
     const [[contact]]: any = await conn.query('SELECT c.id FROM contacts c JOIN contact_identifiers i ON i.contact_id=c.id WHERE i.jid=? LIMIT 1 FOR UPDATE', [jid])
     if (!contact) throw new Error('No se pudo asociar la cita al contacto')
     const [conflicts]: any = await conn.query(`SELECT id FROM appointments WHERE status='booked' AND starts_at < ? AND ends_at > ? LIMIT 1 FOR UPDATE`, [endsAt, startsAt])
-    if (conflicts.length) { await conn.rollback(); return { booked: false } }
+    if (conflicts.length) {
+      const result = { booked: false }
+      if (effectKey) { await conn.execute('INSERT INTO conversation_effects (effect_key,effect_type,result_json) VALUES (?,?,?)', [effectKey,'appointment:book',JSON.stringify(result)]);await conn.commit() }
+      else await conn.rollback()
+      return result
+    }
     const [result]: any = await conn.execute('INSERT INTO appointments (contact_id,starts_at,ends_at,service_requested,status) VALUES (?,?,?,?,\'booked\')', [contact.id, startsAt, endsAt, serviceRequested])
+    const booked = { booked: true, appointment: { id: Number(result.insertId), startsAt, endsAt, serviceRequested } }
+    if (effectKey) await conn.execute('INSERT INTO conversation_effects (effect_key,effect_type,result_json) VALUES (?,?,?)', [effectKey,'appointment:book',JSON.stringify(booked)])
     await conn.commit()
-    return { booked: true, appointment: { id: Number(result.insertId), startsAt, endsAt, serviceRequested } }
+    return booked
   } catch (error) { await conn.rollback(); throw error }
   finally {
-    if (lockAcquired) await conn.query('SELECT RELEASE_LOCK(?)', ['whatsapp-appointment-booking']).catch(() => undefined)
+    if (lockAcquired) await conn.query('SELECT RELEASE_LOCK(?)', [`whatsapp-appointment-booking:${config.db.database}`]).catch(() => undefined)
     conn.release()
   }
 }
@@ -151,6 +208,63 @@ export async function cancelNextAppointment(jid: string): Promise<AppointmentRec
     await conn.commit()
     return appointment
   } catch (error) { await conn.rollback(); throw error } finally { conn.release() }
+}
+
+export async function cancelAppointmentById(jid: string, appointmentId: number, effectKey: string): Promise<VerifiedResult<AppointmentRecord>> {
+  const conn = await pool.getConnection()
+  try {
+    await conn.beginTransaction()
+    const [[stored]]: any = await conn.execute('SELECT result_json AS resultJson FROM conversation_effects WHERE effect_key=? FOR UPDATE', [effectKey])
+    if (stored) {
+      const value = typeof stored.resultJson === 'string' ? JSON.parse(stored.resultJson) : stored.resultJson
+      if(value.status==='success'){value.value.startsAt = new Date(value.value.startsAt);value.value.endsAt = new Date(value.value.endsAt)}
+      await conn.commit();return value
+    }
+    const [rows]: any = await conn.execute(`SELECT a.id,a.starts_at AS startsAt,a.ends_at AS endsAt,a.service_requested AS serviceRequested
+      FROM appointments a JOIN contact_identifiers i ON i.contact_id=a.contact_id
+      WHERE i.jid=? AND a.id=? AND a.status='booked' AND a.starts_at>=UTC_TIMESTAMP(3) LIMIT 1 FOR UPDATE`, [jid,appointmentId])
+    let result: VerifiedResult<AppointmentRecord>
+    if (!rows.length) result = { status:'rejected', message:'La cita seleccionada ya no está activa o no pertenece a este contacto.' }
+    else {
+      const appointment = { ...rows[0], id:Number(rows[0].id) } as AppointmentRecord
+      await conn.execute("UPDATE appointments SET status='cancelled' WHERE id=?", [appointmentId])
+      result = { status:'success', value:appointment }
+    }
+    await conn.execute('INSERT INTO conversation_effects (effect_key,effect_type,result_json) VALUES (?,?,?)', [effectKey,'appointment:cancel',JSON.stringify(result)])
+    await conn.commit();return result
+  } catch (error) { await conn.rollback();throw error } finally { conn.release() }
+}
+
+export async function rescheduleAppointmentForContact(jid: string, appointmentId: number, startsAt: Date, endsAt: Date, effectKey: string): Promise<VerifiedResult<AppointmentRecord>> {
+  const conn = await pool.getConnection()
+  let lockAcquired = false
+  try {
+    const [[lock]]: any = await conn.query('SELECT GET_LOCK(?,10) AS acquired', [`whatsapp-appointment-booking:${config.db.database}`])
+    if (Number(lock.acquired)!==1) throw new Error('appointment_lock_unavailable')
+    lockAcquired = true
+    await conn.beginTransaction()
+    const [[stored]]: any = await conn.execute('SELECT result_json AS resultJson FROM conversation_effects WHERE effect_key=? FOR UPDATE', [effectKey])
+    if (stored) {
+      const value = typeof stored.resultJson === 'string' ? JSON.parse(stored.resultJson) : stored.resultJson
+      if (value.value) { value.value.startsAt=new Date(value.value.startsAt);value.value.endsAt=new Date(value.value.endsAt) }
+      await conn.commit();return value
+    }
+    const [rows]: any = await conn.execute(`SELECT a.id,a.service_requested AS serviceRequested FROM appointments a JOIN contact_identifiers i ON i.contact_id=a.contact_id
+      WHERE i.jid=? AND a.id=? AND a.status='booked' LIMIT 1 FOR UPDATE`, [jid,appointmentId])
+    let result: VerifiedResult<AppointmentRecord>
+    if (!rows.length) result={status:'rejected',message:'La cita seleccionada ya no está activa o no pertenece a este contacto.'}
+    else {
+      const [conflicts]: any = await conn.execute("SELECT id FROM appointments WHERE status='booked' AND id<>? AND starts_at<? AND ends_at>? LIMIT 1 FOR UPDATE", [appointmentId,endsAt,startsAt])
+      if (conflicts.length) result={status:'rejected',message:'Ese horario ya está ocupado. Elige otra fecha y hora.'}
+      else {
+        await conn.execute('UPDATE appointments SET starts_at=?,ends_at=? WHERE id=?',[startsAt,endsAt,appointmentId])
+        result={status:'success',value:{id:appointmentId,startsAt,endsAt,serviceRequested:rows[0].serviceRequested??null}}
+      }
+    }
+    await conn.execute('INSERT INTO conversation_effects (effect_key,effect_type,result_json) VALUES (?,?,?)',[effectKey,'appointment:reschedule',JSON.stringify(result)])
+    await conn.commit();return result
+  } catch(error){await conn.rollback();throw error}
+  finally{if(lockAcquired)await conn.query('SELECT RELEASE_LOCK(?)',[`whatsapp-appointment-booking:${config.db.database}`]).catch(()=>undefined);conn.release()}
 }
 
 export interface AppointmentListRow extends AppointmentRecord {
@@ -335,7 +449,7 @@ export async function rescheduleAppointment(appointmentId: number, startsAt: Dat
   let lockAcquired = false
   try {
     await conn.beginTransaction()
-    const [[lock]]: any = await conn.query('SELECT GET_LOCK(?,10) AS acquired', ['whatsapp-appointment-booking'])
+    const [[lock]]: any = await conn.query('SELECT GET_LOCK(?,10) AS acquired', [`whatsapp-appointment-booking:${config.db.database}`])
     if (Number(lock.acquired) !== 1) throw new Error('No se pudo bloquear agenda para validar disponibilidad')
     lockAcquired = true
     const [[appointment]]: any = await conn.query('SELECT id FROM appointments WHERE id=? AND status=\'booked\' FOR UPDATE', [appointmentId])
@@ -347,9 +461,70 @@ export async function rescheduleAppointment(appointmentId: number, startsAt: Dat
     return true
   } catch (error) { await conn.rollback(); throw error }
   finally {
-    if (lockAcquired) await conn.query('SELECT RELEASE_LOCK(?)', ['whatsapp-appointment-booking']).catch(() => undefined)
+    if (lockAcquired) await conn.query('SELECT RELEASE_LOCK(?)', [`whatsapp-appointment-booking:${config.db.database}`]).catch(() => undefined)
     conn.release()
   }
+}
+
+function conversationTurnRow(row: any): ConversationTurnRecord {
+  return { id:Number(row.id),jid:row.jid,waMessageId:row.waMessageId,status:row.status,settingsVersion:Number(row.settingsVersion),outcomeKind:row.outcomeKind??null,outboundText:row.outboundText?decryptLocalValue(row.outboundText):null,outboundMessageId:row.outboundMessageId??null,sendAttempts:Number(row.sendAttempts) }
+}
+
+export async function claimConversationTurn(jid: string, waMessageId: string, settingsVersion: number): Promise<{ claimed: boolean; turn: ConversationTurnRecord }> {
+  const [insert]: any = await pool.execute(`INSERT IGNORE INTO conversation_turns (jid,wa_message_id,status,settings_version) VALUES (?,?,'processing',?)`,[jid,waMessageId,settingsVersion])
+  const claimed=insert.affectedRows>0
+  const [[row]]: any = await pool.execute(`SELECT id,jid,wa_message_id AS waMessageId,status,settings_version AS settingsVersion,outcome_kind AS outcomeKind,
+    outbound_text AS outboundText,outbound_message_id AS outboundMessageId,send_attempts AS sendAttempts FROM conversation_turns WHERE jid=? AND wa_message_id=?`,[jid,waMessageId])
+  return {claimed,turn:conversationTurnRow(row)}
+}
+
+export async function prepareConversationReply(turnId: number, outcomeKind: string, text: string, outboundMessageId: string, actionApplied=false): Promise<void> {
+  if(actionApplied)await pool.execute("UPDATE conversation_turns SET status='action_applied',outcome_kind=? WHERE id=?",[outcomeKind,turnId])
+  await pool.execute("UPDATE conversation_turns SET status='send_pending',outcome_kind=?,outbound_text=?,outbound_message_id=?,last_error_code=NULL WHERE id=?",[outcomeKind,encryptLocalValue(text),outboundMessageId,turnId])
+}
+
+export async function markConversationTurnSent(turnId: number): Promise<void> {
+  await pool.execute("UPDATE conversation_turns SET status='sent',send_attempts=send_attempts+1,last_error_code=NULL WHERE id=?",[turnId])
+}
+
+export async function markConversationTurnUncertain(turnId: number, code='send_uncertain'): Promise<void> {
+  await pool.execute("UPDATE conversation_turns SET status='uncertain',send_attempts=send_attempts+1,last_error_code=? WHERE id=?",[code.slice(0,80),turnId])
+}
+
+export async function markConversationTurnFailed(turnId: number, code: string): Promise<void> {
+  await pool.execute("UPDATE conversation_turns SET status='failed',last_error_code=? WHERE id=?",[code.slice(0,80),turnId])
+}
+
+export async function resumeConversationTurn(turnId:number,settingsVersion:number):Promise<void>{
+  await pool.execute("UPDATE conversation_turns SET status='processing',settings_version=?,last_error_code=NULL WHERE id=? AND status IN ('received','processing')",[settingsVersion,turnId])
+}
+
+export async function listRecoverableConversationTurns():Promise<ConversationTurnRecord[]>{
+  const [rows]:any=await pool.query(`SELECT id,jid,wa_message_id AS waMessageId,status,settings_version AS settingsVersion,outcome_kind AS outcomeKind,
+    outbound_text AS outboundText,outbound_message_id AS outboundMessageId,send_attempts AS sendAttempts FROM conversation_turns
+    WHERE status IN ('received','processing','action_applied','send_pending','uncertain') ORDER BY id`)
+  return rows.map(conversationTurnRow)
+}
+
+export async function getPendingIntent(jid: string): Promise<PendingIntentRecord | null> {
+  const [[row]]: any = await pool.execute('SELECT intent_kind AS intentKind,payload,source_message_id AS sourceMessageId FROM pending_intents WHERE jid=? AND expires_at>UTC_TIMESTAMP(3)',[jid])
+  if(!row){await pool.execute('DELETE FROM pending_intents WHERE jid=?',[jid]);return null}
+  const payload=typeof row.payload==='string'?JSON.parse(row.payload):row.payload
+  return {intent:{...payload,kind:row.intentKind},sourceMessageId:row.sourceMessageId}
+}
+
+export async function savePendingIntent(jid: string, record: PendingIntentRecord): Promise<void> {
+  await pool.execute(`INSERT INTO pending_intents (jid,intent_kind,payload,expires_at,source_message_id) VALUES (?,?,?,?,?)
+    ON DUPLICATE KEY UPDATE intent_kind=VALUES(intent_kind),payload=VALUES(payload),expires_at=VALUES(expires_at),source_message_id=VALUES(source_message_id)`,
+  [jid,record.intent.kind,JSON.stringify(record.intent),new Date(record.intent.expiresAt),record.sourceMessageId])
+}
+
+export async function clearPendingIntent(jid: string): Promise<void> { await pool.execute('DELETE FROM pending_intents WHERE jid=?',[jid]) }
+
+export async function getConversationEffect(turnId:number):Promise<{effectKey:string;effectType:string;result:any}|null>{
+  const [rows]:any=await pool.execute('SELECT effect_key AS effectKey,effect_type AS effectType,result_json AS resultJson FROM conversation_effects WHERE effect_key LIKE ? ORDER BY created_at LIMIT 1',[`turn:${turnId}:%`])
+  if(!rows.length)return null
+  return {effectKey:rows[0].effectKey,effectType:rows[0].effectType,result:typeof rows[0].resultJson==='string'?JSON.parse(rows[0].resultJson):rows[0].resultJson}
 }
 
 export async function exportContactData(contactId: number): Promise<Record<string, unknown> | null> {
@@ -362,16 +537,50 @@ export async function exportContactData(contactId: number): Promise<Record<strin
   const [orders]: any = await pool.execute('SELECT id,status,total,currency,created_at AS createdAt FROM orders WHERE contact_id=? ORDER BY created_at', [contactId])
   const [orderItems]: any = await pool.execute('SELECT oi.order_id AS orderId,oi.sku,oi.item_type AS itemType,oi.item_name AS itemName,oi.quantity,oi.unit_price AS unitPrice,oi.currency FROM order_items oi JOIN orders o ON o.id=oi.order_id WHERE o.contact_id=? ORDER BY oi.order_id,oi.id', [contactId])
   const [cartItems]: any = await pool.execute('SELECT ci.sku,ci.item_name AS itemName,ci.item_type AS itemType,ci.quantity,ci.unit_price AS unitPrice,ci.currency FROM shopping_carts sc JOIN shopping_cart_items ci ON ci.cart_id=sc.id WHERE sc.contact_id=?', [contactId])
-  return { contact, identifiers, messages, appointments, orders, orderItems, cartItems }
+  const jids=identifiers.map((item:any)=>item.jid)
+  const conversationTurns:any[]=[]
+  const pendingIntents:any[]=[]
+  const conversationEffects:any[]=[]
+  for(const jid of jids){
+    const [turns]:any=await pool.execute(`SELECT id,jid,wa_message_id AS waMessageId,status,settings_version AS settingsVersion,outcome_kind AS outcomeKind,outbound_text AS outboundText,outbound_message_id AS outboundMessageId,send_attempts AS sendAttempts,created_at AS createdAt FROM conversation_turns WHERE jid=? ORDER BY id`,[jid])
+    for(const turn of turns){
+      conversationTurns.push({...turn,outboundText:turn.outboundText?decryptLocalValue(turn.outboundText):null})
+      const [effects]:any=await pool.execute('SELECT effect_key AS effectKey,effect_type AS effectType,result_json AS result,created_at AS createdAt FROM conversation_effects WHERE effect_key LIKE ? ORDER BY created_at',[`turn:${turn.id}:%`])
+      conversationEffects.push(...effects)
+    }
+    const [pending]:any=await pool.execute('SELECT intent_kind AS intentKind,payload,expires_at AS expiresAt,source_message_id AS sourceMessageId,created_at AS createdAt FROM pending_intents WHERE jid=?',[jid])
+    pendingIntents.push(...pending)
+  }
+  return { contact, identifiers, messages, appointments, orders, orderItems, cartItems, conversationTurns, conversationEffects, pendingIntents }
+}
+
+export async function getContactIdentifiers(contactId:number):Promise<Array<{jid:string}>>{
+  const [rows]:any=await pool.execute('SELECT jid FROM contact_identifiers WHERE contact_id=? ORDER BY jid',[contactId])
+  return rows
 }
 
 export async function deleteContactData(contactId: number): Promise<boolean> {
-  const [result]: any = await pool.execute('DELETE FROM contacts WHERE id=?', [contactId])
-  return result.affectedRows > 0
+  const conn=await pool.getConnection()
+  try{
+    await conn.beginTransaction()
+    const [identifiers]:any=await conn.execute('SELECT jid FROM contact_identifiers WHERE contact_id=? FOR UPDATE',[contactId])
+    for(const {jid} of identifiers){
+      const [turns]:any=await conn.execute('SELECT id FROM conversation_turns WHERE jid=? FOR UPDATE',[jid])
+      for(const turn of turns)await conn.execute('DELETE FROM conversation_effects WHERE effect_key LIKE ?',[`turn:${turn.id}:%`])
+      await conn.execute('DELETE FROM pending_intents WHERE jid=?',[jid])
+      await conn.execute('DELETE FROM conversation_turns WHERE jid=?',[jid])
+    }
+    const [result]:any=await conn.execute('DELETE FROM contacts WHERE id=?',[contactId])
+    await conn.commit()
+    return result.affectedRows>0
+  }catch(error){await conn.rollback();throw error}finally{conn.release()}
 }
 
 export async function deleteMessagesOlderThan(days: number): Promise<number> {
   const [result]: any = await pool.execute('DELETE FROM messages WHERE created_at < DATE_SUB(UTC_TIMESTAMP(3), INTERVAL ? DAY)', [days])
+  await pool.execute('DELETE FROM pending_intents WHERE expires_at<UTC_TIMESTAMP(3)')
+  await pool.execute('DELETE FROM conversation_effects WHERE created_at < DATE_SUB(UTC_TIMESTAMP(3), INTERVAL ? DAY)',[days])
+  await pool.execute('DELETE FROM conversation_turns WHERE created_at < DATE_SUB(UTC_TIMESTAMP(3), INTERVAL ? DAY)',[days])
   return result.affectedRows
 }
 
@@ -403,6 +612,21 @@ async function mergeContacts(conn: PoolConnection, keep: number, remove: number)
       SELECT ?,wa_message_id,from_me,sender_jid,message_type,text,message_timestamp,status,is_deleted,deleted_at,raw_payload,created_at,updated_at FROM messages WHERE chat_id=?`, [keepChat.id, removeChat.id])
     await conn.query('DELETE FROM chats WHERE id=?', [removeChat.id])
   } else if (removeChat) await conn.query('UPDATE chats SET contact_id=? WHERE id=?', [keep, removeChat.id])
+  const [[keepCart]]: any = await conn.query('SELECT id FROM shopping_carts WHERE contact_id=?',[keep])
+  const [[removeCart]]: any = await conn.query('SELECT id FROM shopping_carts WHERE contact_id=?',[remove])
+  if(keepCart&&removeCart){
+    await conn.query(`INSERT INTO shopping_cart_items (cart_id,inventory_item_id,sku,item_type,item_name,quantity,unit_price,currency)
+      SELECT ?,inventory_item_id,sku,item_type,item_name,quantity,unit_price,currency FROM shopping_cart_items WHERE cart_id=?
+      ON DUPLICATE KEY UPDATE quantity=LEAST(999,shopping_cart_items.quantity+VALUES(quantity)),inventory_item_id=VALUES(inventory_item_id),item_name=VALUES(item_name),unit_price=VALUES(unit_price),currency=VALUES(currency)`,[keepCart.id,removeCart.id])
+    await conn.query('DELETE FROM shopping_carts WHERE id=?',[removeCart.id])
+  }else if(removeCart)await conn.query('UPDATE shopping_carts SET contact_id=? WHERE id=?',[keep,removeCart.id])
+  await conn.query(`INSERT INTO contact_profiles (contact_id,custom_name,tags,notes)
+    SELECT ?,custom_name,tags,notes FROM contact_profiles WHERE contact_id=?
+    ON DUPLICATE KEY UPDATE custom_name=COALESCE(contact_profiles.custom_name,VALUES(custom_name)),tags=COALESCE(contact_profiles.tags,VALUES(tags)),notes=COALESCE(contact_profiles.notes,VALUES(notes))`,[keep,remove])
+  await conn.query(`INSERT INTO chat_settings (contact_id,bot_paused) SELECT ?,bot_paused FROM chat_settings WHERE contact_id=?
+    ON DUPLICATE KEY UPDATE bot_paused=GREATEST(chat_settings.bot_paused,VALUES(bot_paused))`,[keep,remove])
+  await conn.query('UPDATE appointments SET contact_id=? WHERE contact_id=?',[keep,remove])
+  await conn.query('UPDATE orders SET contact_id=? WHERE contact_id=?',[keep,remove])
   await conn.query('UPDATE contact_identifiers SET contact_id=? WHERE contact_id=?', [keep, remove])
   await conn.query('DELETE FROM contacts WHERE id=?', [remove])
 }

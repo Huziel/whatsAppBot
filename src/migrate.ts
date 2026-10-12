@@ -15,21 +15,18 @@ async function main(): Promise<void> {
   const connection = await mysql.createConnection({ host, port, user, password, charset: 'utf8mb4', multipleStatements: true, timezone: 'Z' })
   try {
     await connection.query("SET time_zone = '+00:00'")
+    const escapedDatabase = `\`${database.replace(/`/g, '``')}\``
+    await connection.query(`CREATE DATABASE IF NOT EXISTS ${escapedDatabase} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`)
+    await connection.query(`USE ${escapedDatabase}`)
     const migrationDir = path.resolve('migrations')
     const files = (await fs.readdir(migrationDir)).filter(file => /^\d+.*\.sql$/.test(file)).sort()
     for (const file of files) {
-      const [rows]: any = await connection.query('SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME=?', [database])
-      if (!rows.length && file !== files[0]) throw new Error(`La base ${database} no existe. Ejecuta la migración inicial.`)
-      if (rows.length) {
-        await connection.query(`USE \`${database.replace(/`/g, '``')}\``)
-        const [migrationTable]: any = await connection.query("SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA=? AND TABLE_NAME='schema_migrations'", [database])
-        if (migrationTable.length) {
-          const [[applied]]: any = await connection.query('SELECT version FROM schema_migrations WHERE version=?', [file])
-          if (applied) continue
-        }
+      const [migrationTable]: any = await connection.query("SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA=? AND TABLE_NAME='schema_migrations'", [database])
+      if (migrationTable.length) {
+        const [[applied]]: any = await connection.query('SELECT version FROM schema_migrations WHERE version=?', [file])
+        if (applied) continue
       }
       await connection.query(await fs.readFile(path.join(migrationDir, file), 'utf8'))
-      await connection.query(`USE \`${database.replace(/`/g, '``')}\``)
       await connection.query('INSERT IGNORE INTO schema_migrations (version) VALUES (?)', [file])
       console.info(`Migración aplicada: ${file}`)
     }

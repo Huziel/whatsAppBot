@@ -23,6 +23,7 @@ export const config = {
     user: required('DB_USER'), password: required('DB_PASSWORD'),
   },
   authDir: path.resolve(required('AUTH_DIR', './auth')),
+  dataDir: path.resolve(required('APP_DATA_DIR', './data')),
   logLevel: required('LOG_LEVEL', 'info'),
   autoReply: autoReplyValue === 'true',
   replyDelayMs,

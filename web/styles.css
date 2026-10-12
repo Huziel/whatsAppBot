@@ -1,0 +1,53 @@
+@import "tailwindcss";
+@source "./index.html";
+@source "./js";
+
+@theme {
+  --color-void: #060B09;
+  --color-panel: #101B16;
+  --color-panel-raised: #14221B;
+  --color-whatsapp: #25D366;
+  --color-emerald: #10B981;
+  --color-mist: #EAF7EF;
+  --color-muted: #A4B8AC;
+  --color-amber: #F4B860;
+  --color-danger: #F87171;
+  --shadow-glow: 0 0 32px rgba(37, 211, 102, .12);
+  --shadow-card: 0 20px 60px rgba(0, 0, 0, .24);
+  --background-image-grid-glow: radial-gradient(circle at 15% 0%, rgba(37,211,102,.11), transparent 34%), radial-gradient(circle at 100% 22%, rgba(16,185,129,.07), transparent 28%);
+}
+
+@layer base {
+  html { scroll-behavior: smooth; }
+  body { @apply min-h-screen bg-void text-mist antialiased; }
+  input, textarea, select { color-scheme: dark; }
+  button, a { -webkit-tap-highlight-color: transparent; }
+  :focus-visible { @apply outline-none ring-2 ring-whatsapp ring-offset-2 ring-offset-void; }
+}
+
+@layer components {
+  .glass-panel { @apply rounded-2xl border border-white/[.08] bg-panel/80 shadow-card backdrop-blur-xl; }
+  .field-label { @apply mb-2 block text-xs font-semibold uppercase tracking-[.14em] text-muted; }
+  .control { @apply w-full rounded-xl border border-white/10 bg-black/30 px-3.5 py-3 text-sm text-mist placeholder:text-slate-500 transition focus:border-whatsapp/60 focus:bg-black/40; }
+  .control-area { @apply min-h-24 w-full resize-y rounded-xl border border-white/10 bg-black/30 px-3.5 py-3 text-sm leading-6 text-mist placeholder:text-slate-500 transition focus:border-whatsapp/60 focus:bg-black/40; }
+  .btn { @apply inline-flex min-h-10 items-center justify-center gap-2 rounded-xl border border-white/10 px-4 py-2 text-sm font-semibold text-mist transition hover:border-white/20 hover:bg-white/[.06] disabled:cursor-not-allowed disabled:opacity-40; }
+  .btn-primary { @apply inline-flex min-h-10 items-center justify-center gap-2 rounded-xl border border-whatsapp/30 bg-whatsapp/15 px-4 py-2 text-sm font-semibold text-green-100 transition hover:border-whatsapp/60 hover:bg-whatsapp/25 disabled:cursor-not-allowed disabled:opacity-40; }
+  .btn-danger { @apply inline-flex min-h-10 items-center justify-center gap-2 rounded-xl border border-danger/25 bg-danger/10 px-4 py-2 text-sm font-semibold text-red-100 transition hover:bg-danger/20 disabled:cursor-not-allowed disabled:opacity-40; }
+  .eyebrow { @apply text-[11px] font-bold uppercase tracking-[.22em] text-whatsapp; }
+  .table-shell { @apply overflow-x-auto rounded-xl border border-white/[.07]; }
+  .data-table { @apply min-w-full border-collapse text-left text-sm; }
+  .data-table th { @apply whitespace-nowrap bg-white/[.035] px-4 py-3 text-[11px] font-semibold uppercase tracking-[.12em] text-muted; }
+  .data-table td { @apply border-t border-white/[.06] px-4 py-3 align-middle text-sm text-slate-200; }
+  .data-table tbody tr { @apply transition hover:bg-white/[.025]; }
+  .nav-link { @apply flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium text-slate-400 transition hover:bg-white/[.06] hover:text-mist; }
+  .nav-link[aria-current="page"] { @apply flex items-center gap-3 rounded-xl border border-whatsapp/15 bg-whatsapp/10 px-3 py-2.5 text-sm font-medium text-green-100 shadow-glow; }
+  .badge { @apply inline-flex items-center gap-1.5 rounded-full border border-white/10 bg-white/[.04] px-2.5 py-1 text-xs font-semibold text-slate-300; }
+  .badge-success { @apply inline-flex items-center gap-1.5 rounded-full border border-whatsapp/20 bg-whatsapp/10 px-2.5 py-1 text-xs font-semibold text-green-200; }
+  .badge-warning { @apply inline-flex items-center gap-1.5 rounded-full border border-amber/20 bg-amber/10 px-2.5 py-1 text-xs font-semibold text-amber; }
+  .section-title { @apply text-xl font-semibold tracking-tight text-mist; }
+  .section-copy { @apply mt-1 max-w-3xl text-sm leading-6 text-muted; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; transition-duration: .01ms !important; }
+}

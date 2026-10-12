@@ -1,5 +1,3 @@
-USE whatsapp_local;
-
 CREATE TABLE IF NOT EXISTS chat_settings (
   contact_id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
   bot_paused BOOLEAN NOT NULL DEFAULT FALSE,

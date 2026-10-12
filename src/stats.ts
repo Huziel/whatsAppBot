@@ -1,4 +1,6 @@
 import fs from 'node:fs/promises'
+import path from 'node:path'
+import { config } from './config'
 import { pool } from './db'
 
 async function main(): Promise<void> {
@@ -8,7 +10,7 @@ async function main(): Promise<void> {
     const [[chats]]: any = await pool.query('SELECT COUNT(*) total FROM chats')
     const [[messages]]: any = await pool.query('SELECT COUNT(*) total FROM messages')
     let pending = 0
-    try { pending = (await fs.readFile('./data/pending-operations.jsonl', 'utf8')).split(/\r?\n/).filter(Boolean).length } catch (error: any) { if (error.code !== 'ENOENT') throw error }
+    try { pending = (await fs.readFile(path.join(config.dataDir, 'pending-operations.jsonl'), 'utf8')).split(/\r?\n/).filter(Boolean).length } catch (error: any) { if (error.code !== 'ENOENT') throw error }
     console.table({ contacts: contacts.total, unresolved_identities: unresolved.total, chats: chats.total, messages: messages.total, pending_writes: pending })
   } finally { await pool.end() }
 }

@@ -1,5 +1,3 @@
-USE whatsapp_local;
-
 INSERT IGNORE INTO inventory_items (item_type,sku,name,description,price,currency,stock_quantity,is_active) VALUES
   ('product','DEMO-PRODUCT-002','DEMO - Termo de acero','Producto de demostración de 600 ml.',249.00,'MXN',8,FALSE),
   ('product','DEMO-PRODUCT-003','DEMO - Cuaderno','Cuaderno de demostración de 100 hojas.',89.00,'MXN',25,FALSE),

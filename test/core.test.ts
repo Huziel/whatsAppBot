@@ -13,6 +13,7 @@ import { resolveAppointmentStart } from '../src/appointment-time'
 import { decryptAppSettings, encryptAppSettings } from '../src/settings-crypto'
 import { PerContactRateLimiter } from '../src/rate-limit'
 import { ConversationEntry, mergeConversationTurns, RecentConversationMemory } from '../src/conversation'
+import { getSettings, setSettings, subscribeSettings, updateSettingsDraft } from '../web/js/state.mjs'
 
 test('la clave de deduplicación distingue direction y chat, y es estable', () => {
   assert.equal(messageDedupKey(9, 'ABCD', false), messageDedupKey(9, 'ABCD', false))
@@ -228,6 +229,31 @@ test('el límite de respuestas es independiente por contacto y se renueva por ho
   assert.equal(limiter.consume('contact-A', 2, 3_000), false)
   assert.equal(limiter.consume('contact-B', 2, 3_000), true)
   assert.equal(limiter.consume('contact-A', 2, 3_601_001), true)
+})
+
+test('estado compartido del dashboard conserva ajustes de otras secciones', () => {
+  setSettings({ botName: 'Bot A', businessName: 'Negocio A', transferClabe: '012345678901234567', appointmentTimeZone: 'America/Mexico_City', aiTone: 'professional' })
+  updateSettingsDraft({ aiTone: 'friendly' })
+  let notified: any
+  const unsubscribe = subscribeSettings((settings, dirty) => { notified = { settings, dirty } })
+  updateSettingsDraft({ appointmentTimeZone: 'UTC' })
+  unsubscribe()
+  assert.equal(getSettings()?.botName, 'Bot A')
+  assert.equal(getSettings()?.transferClabe, '012345678901234567')
+  assert.equal(notified.settings.aiTone, 'friendly')
+  assert.equal(notified.settings.appointmentTimeZone, 'UTC')
+  assert.equal(notified.dirty, true)
+})
+
+test('dashboard conserva destinos de navegación y campos opcionales accesibles', async () => {
+  const html = await fs.readFile(path.resolve('web/index.html'), 'utf8')
+  const routes = [...html.matchAll(/data-route="([^"]+)"/g)].map(match => match[1])
+  assert.ok(routes.includes('dashboard') && routes.includes('conversations') && routes.includes('privacy'))
+  for (const route of new Set(routes)) assert.match(html, new RegExp(`id="view-${route}"`))
+  assert.match(html, /id="view-ai" data-view="ai" class="page-view hidden/)
+  assert.match(html, /id="view-privacy" data-view="privacy" class="page-view hidden/)
+  assert.match(html, /id="clearDeepseekApiKey" type="checkbox"/)
+  assert.match(html, /aria-label="Abrir navegación"/)
 })
 
 test('valida inventario y fuerza existencias nulas en servicios', () => {

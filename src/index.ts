@@ -1,19 +1,23 @@
 import makeWASocket, { Browsers, BufferJSON, DisconnectReason, extractMessageContent, fetchLatestBaileysVersion, useMultiFileAuthState, WAMessage } from '@whiskeysockets/baileys'
 import { Boom } from '@hapi/boom'
 import { spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import fs from 'node:fs/promises'
+import path from 'node:path'
 import pino from 'pino'
 import qrcode from 'qrcode-terminal'
 import { DateTime } from 'luxon'
 import { config } from './config'
-import { applyShoppingCartAction, CartAction, CartLine, cancelNextAppointment, closePool, createAppointment, deleteContactData, deleteMessagesOlderThan, exportContactData, getContactJid, getRecentConversation, getShoppingCart, getUpcomingAppointments, isChatBotPaused, listActiveInventory, pool, StoredMessage } from './db'
+import { applyShoppingCartActionVerified, cancelAppointmentById, claimConversationTurn, clearPendingIntent, closePool, createAppointment, deleteContactData, deleteMessagesOlderThan, getContactIdentifiers, getContactJid, getConversationEffect, getPendingIntent, getRecentConversation, getShoppingCart, getUpcomingAppointments, isChatBotPaused, listActiveInventory, listRecoverableConversationTurns, markConversationTurnFailed, markConversationTurnSent, markConversationTurnUncertain, pool, prepareConversationReply, rescheduleAppointmentForContact, resumeConversationTurn, savePendingIntent, StoredMessage } from './db'
 import { AppointmentPromptSettings, CatalogRequest, DeepSeekModel, detectCatalogRequest, detectPaymentRequest, generateDeepSeekResponse } from './deepseek'
 import { ConversationEntry, mergeConversationTurns, RecentConversationMemory } from './conversation'
-import { formatAppointmentLocal, resolveAppointmentStart } from './appointment-time'
+import { authorizeCartMutation, classifyPaymentIntent, formatInventoryFact, formatVerifiedCart, isAffirmative, isNegative, KeyedSerialExecutor, PendingIntent, safeConversationalReply, selectedOption } from './conversation-flow'
+import { formatAppointmentLocal, resolveAppointmentStart, resolveRelativeAppointmentText } from './appointment-time'
 import { isIndividualJid } from './identity'
 import { logger } from './logger'
 import { isNonContentProtocolType, normalizeMessage, shouldAutoReply, timestampDate } from './message'
 import { PersistentQueue } from './queue'
+import { deliverWithStableId } from './outbound-delivery'
 import { PerContactRateLimiter } from './rate-limit'
 import { AppSettings, launchConfigUi, loadAppSettings } from './config-ui'
 
@@ -29,7 +33,7 @@ function suppressSignalSessionKeyDumps(): void {
 
 suppressSignalSessionKeyDumps()
 
-const queue = new PersistentQueue()
+const queue = new PersistentQueue(path.join(config.dataDir, 'pending-operations.jsonl'))
 const conversationMemory = new RecentConversationMemory(30, 1_000)
 let socket: ReturnType<typeof makeWASocket> | undefined
 let reconnectTimer: NodeJS.Timeout | undefined
@@ -45,34 +49,23 @@ const knownNames = new Map<string, string>()
 const defaultAppSettings: AppSettings = { botName: 'Asistente de WhatsApp', businessName: 'Mi negocio', autoReply: config.autoReply, responseMode: 'fixed', responseText: 'HOLA SOY EL BOT', replyDelayMs: config.replyDelayMs, saveToDatabase: true, deepseekApiKey: '', deepseekModel: 'deepseek-flash', aiTone: 'professional', aiResponseLength: 'brief', aiSystemInstructions: '', maxRepliesPerHour: 20, messageRetentionDays: 0, productCatalogImageUrl: null, serviceCatalogImageUrl: null, transferEnabled: false, transferBankName: '', transferAccountHolder: '', transferAccountNumber: '', transferClabe: '', transferInstructions: '', appointmentsEnabled: false, appointmentTimeZone: 'America/Mexico_City', appointmentDays: [1, 2, 3, 4, 5], appointmentStartTime: '09:00', appointmentEndTime: '17:00', appointmentDurationMinutes: 60 }
 let waVersion: [number, number, number] | undefined
 let processStartedAtSeconds = 0
-let replySettings: { enabled: boolean; mode: 'fixed' | 'deepseek'; text: string; delayMs: number; deepseekApiKey: string; deepseekModel: DeepSeekModel; aiTone: 'friendly' | 'professional' | 'formal'; aiResponseLength: 'brief' | 'balanced' | 'detailed'; customInstructions: string; maxRepliesPerHour: number } = {
-  enabled: config.autoReply, mode: 'fixed', text: 'HOLA SOY EL BOT', delayMs: config.replyDelayMs, deepseekApiKey: '', deepseekModel: 'deepseek-flash', aiTone: 'professional', aiResponseLength: 'brief', customInstructions: '', maxRepliesPerHour: 20,
-}
-let generalCatalogImages = { products: null as string | null, services: null as string | null }
-let transferSettings = { enabled: false, bankName: '', accountHolder: '', accountNumber: '', clabe: '', instructions: '' }
-let appointmentSettings: AppointmentPromptSettings = { enabled: false, timeZone: 'America/Mexico_City', days: [1, 2, 3, 4, 5], startTime: '09:00', endTime: '17:00', durationMinutes: 60, nowLocal: '' }
-let botIdentity = { botName: defaultAppSettings.botName, businessName: defaultAppSettings.businessName }
-const repliedMessageKeys = new Set<string>()
+interface RuntimeSnapshot { version:number; settings:AppSettings }
+let runtimeSnapshot: RuntimeSnapshot = { version:0, settings:defaultAppSettings }
 let configServer: Awaited<ReturnType<typeof launchConfigUi>> | undefined
 let retentionTimer: NodeJS.Timeout | undefined
 const replyRateLimiter = new PerContactRateLimiter()
+const attemptRateLimiter = new PerContactRateLimiter()
+const chatExecutor = new KeyedSerialExecutor()
 
 const wait = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))
 
-function personalizeFixedResponse(text: string): string {
-  return text.replaceAll('{botName}', botIdentity.botName).replaceAll('{businessName}', botIdentity.businessName)
+function personalizeFixedResponse(text: string, settings: AppSettings): string {
+  return text.replaceAll('{botName}', settings.botName).replaceAll('{businessName}', settings.businessName)
 }
 
-function formatCartSummary(action: CartAction, lines: CartLine[]): string {
-  if (action === 'clear') return 'Carrito vaciado. No se realizó ningún cobro ni reserva.'
-  const prefix = action === 'show' ? 'Tu carrito actual:' : 'Carrito actualizado:'
-  if (!lines.length) return action === 'show' ? 'Tu carrito está vacío.' : `${prefix} está vacío. No se realizó ningún cobro ni reserva.`
-  const items = lines.map(line => {
-    const price = line.unitPrice === null ? 'precio por cotizar' : `${line.unitPrice} ${line.currency} c/u`
-    return `• ${line.quantity} × ${line.itemName} — ${price}`
-  })
-  return `${prefix}\n${items.join('\n')}\n\nEl carrito es informativo; no se realizó ningún cobro ni reserva de existencias.`
-}
+const stableOutboundId = (jid:string,messageId:string):string => `bot-${createHash('sha256').update(`${jid}:${messageId}`).digest('hex').slice(0,32)}`
+const settingsVersion = (settings:AppSettings):number => Number.parseInt(createHash('sha256').update(JSON.stringify(settings)).digest('hex').slice(0,12),16)
+const pendingExpiry = ():string => new Date(Date.now()+10*60*1000).toISOString()
 
 function rememberLiveMessage(message: WAMessage): void {
   const jid = targetJid(message)
@@ -133,6 +126,292 @@ async function enqueueMessage(message: WAMessage): Promise<void> {
   await persist('message', item)
 }
 
+function appointmentPromptSettings(settings: AppSettings): AppointmentPromptSettings {
+  return { enabled:settings.appointmentsEnabled,timeZone:settings.appointmentTimeZone,days:settings.appointmentDays,startTime:settings.appointmentStartTime,endTime:settings.appointmentEndTime,durationMinutes:settings.appointmentDurationMinutes,nowLocal:DateTime.now().setZone(settings.appointmentTimeZone).toFormat("yyyy-MM-dd'T'HH:mm") }
+}
+
+function appointmentLabel(item: { startsAt:Date; serviceRequested:string|null }, settings:AppSettings):string {
+  return `${formatAppointmentLocal(item.startsAt,settings.appointmentTimeZone)}${item.serviceRequested?` — ${item.serviceRequested}`:''}`
+}
+
+function verifiedInventoryAnswer(input:string, inventory:Awaited<ReturnType<typeof listActiveInventory>>):string|null {
+  const normalized=input.normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase()
+  if(!/\b(precio|cuesta|costo|stock|disponible|disponibilidad|existencias?)\b/.test(normalized))return null
+  const matches=inventory.filter(item=>normalized.includes(item.sku.toLowerCase())||normalized.includes(item.name.normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase()))
+  if(matches.length!==1)return matches.length>1?`Encontré varias opciones:\n${matches.slice(0,5).map((item,index)=>`${index+1}. ${item.name} (${item.sku})`).join('\n')}\nIndica cuál quieres consultar.`:null
+  const item=matches[0]
+  return `${formatInventoryFact(item)}.`
+}
+
+function isCommittedOutcome(outcomeKind:string|null|undefined):boolean{return ['action_applied','cart_applied','recovered_action'].includes(outcomeKind??'')}
+
+async function sendPreparedTurn(current:ReturnType<typeof makeWASocket>,turn:{id:number;settingsVersion:number;outcomeKind?:string|null;outboundText:string|null;outboundMessageId:string|null},quoted:WAMessage|undefined,jid:string):Promise<void>{
+  if(!turn.outboundText||!turn.outboundMessageId)return
+  const active=runtimeSnapshot.settings
+  if(turn.settingsVersion!==runtimeSnapshot.version&&!isCommittedOutcome(turn.outcomeKind)){await markConversationTurnFailed(turn.id,'settings_changed');return}
+  if(!active.autoReply||stopping||!serviceEnabled||socket!==current){await markConversationTurnFailed(turn.id,'reply_disabled');return}
+  try{if(await isChatBotPaused(jid)){await markConversationTurnFailed(turn.id,'chat_paused');return}}catch{await markConversationTurnFailed(turn.id,'pause_check_failed');return}
+  if(!replyRateLimiter.allows(jid,active.maxRepliesPerHour)){await markConversationTurnFailed(turn.id,'reply_quota');return}
+  const outboundText=turn.outboundText,outboundMessageId=turn.outboundMessageId
+  const delivery=await deliverWithStableId(outboundMessageId,async messageId=>{
+    const sent=await current.sendMessage(jid,{text:outboundText},quoted?{quoted,messageId}:{messageId})
+    return {id:sent?.key.id??null}
+  })
+  if(delivery.status==='uncertain'){await markConversationTurnUncertain(turn.id);return}
+  replyRateLimiter.record(jid)
+  await markConversationTurnSent(turn.id)
+  conversationMemory.remember(jid,{id:delivery.externalId,role:'assistant',content:outboundText,timestampMs:Date.now()})
+}
+
+async function recoverConversationTurns(current:ReturnType<typeof makeWASocket>):Promise<void>{
+  const turns=await listRecoverableConversationTurns()
+  await Promise.allSettled(turns.map(turn=>chatExecutor.run(turn.jid,async()=>{
+    let currentTurn=turn
+    if(['received','processing','action_applied'].includes(turn.status)){
+      const recovered=await recoverVerifiedEffect(turn.id,turn.jid,runtimeSnapshot.settings)
+      const text=recovered??'La operación se interrumpió antes de poder completarse. No confirmé ningún cambio; envía nuevamente tu solicitud.'
+      const outboundMessageId=stableOutboundId(turn.jid,turn.waMessageId)
+      if(!recovered)await resumeConversationTurn(turn.id,runtimeSnapshot.version)
+      await prepareConversationReply(turn.id,recovered?'recovered_action':'interrupted_before_action',text,outboundMessageId,!!recovered)
+      currentTurn={...turn,status:'send_pending',settingsVersion:recovered?turn.settingsVersion:runtimeSnapshot.version,outcomeKind:recovered?'recovered_action':'interrupted_before_action',outboundText:text,outboundMessageId}
+    }
+    await sendPreparedTurn(current,currentTurn,undefined,turn.jid)
+  })))
+}
+
+async function isTurnAuthorized(jid:string,settingsVersion:number):Promise<boolean>{
+  if(runtimeSnapshot.version!==settingsVersion||!runtimeSnapshot.settings.autoReply)return false
+  try{return !(await isChatBotPaused(jid))}catch{return false}
+}
+
+async function resolvePendingIntent(jid:string,messageId:string,input:string,settings:AppSettings,settingsVersion:number,turnId:number):Promise<{handled:boolean;text?:string;actionApplied?:boolean}>{
+  const record=await getPendingIntent(jid)
+  if(!record)return {handled:false}
+  const pending=record.intent
+  if(pending.kind!=='cart_selection'&&(!settings.appointmentsEnabled||pending.settingsVersion!==settingsVersion||pending.timeZone!==settings.appointmentTimeZone)){
+    await clearPendingIntent(jid)
+    return {handled:true,text:'La configuración de agenda cambió. No realicé la operación; inicia nuevamente la solicitud.'}
+  }
+  if(isNegative(input)){await clearPendingIntent(jid);return {handled:true,text:'Entendido. No realicé ningún cambio.'}}
+  if(pending.kind==='cart_selection'){
+    const choice=selectedOption(input,pending.candidates.length)
+    if(choice===null)return {handled:true,text:`Elige una opción:\n${pending.candidates.map((item,index)=>`${index+1}. ${item.name} (${item.sku})`).join('\n')}`}
+    const selected=pending.candidates[choice]
+    if(!(await isTurnAuthorized(jid,settingsVersion)))return {handled:true,text:'La atención automática fue pausada. No realicé cambios.'}
+    const result=await applyShoppingCartActionVerified(jid,pending.action,[{sku:selected.sku,quantity:pending.quantity}],`turn:${turnId}:pending-cart`)
+    await clearPendingIntent(jid)
+    return {handled:true,text:formatVerifiedCart(result,pending.action),actionApplied:result.status==='success'}
+  }
+  if(pending.kind==='appointment_book_confirmation'){
+    if(!isAffirmative(input))return {handled:true,text:`Confirma con “sí” para agendar ${pending.localStart}${pending.service?` — ${pending.service}`:''}, o responde “no”.`}
+    try{
+      if(!(await isTurnAuthorized(jid,settingsVersion)))return {handled:true,text:'La atención automática fue pausada. No realicé cambios.'}
+      const local=resolveAppointmentStart(pending.localStart,{timeZone:settings.appointmentTimeZone,days:settings.appointmentDays,startTime:settings.appointmentStartTime,endTime:settings.appointmentEndTime,durationMinutes:settings.appointmentDurationMinutes})
+      const result=await createAppointment(jid,local.toUTC().toJSDate(),local.plus({minutes:settings.appointmentDurationMinutes}).toUTC().toJSDate(),pending.service,`turn:${turnId}:pending-appointment-book`)
+      await clearPendingIntent(jid)
+      return result.booked
+        ? {handled:true,text:`Cita agendada para ${local.setLocale('es').toFormat('cccc dd LLL yyyy, HH:mm')} (${settings.appointmentTimeZone}), duración ${settings.appointmentDurationMinutes} minutos${pending.service?`, servicio: ${pending.service}`:''}. No se realizó ningún cobro.`,actionApplied:true}
+        : {handled:true,text:'Ese horario ya está ocupado. Indica otra fecha y hora para revisar disponibilidad.'}
+    }catch{return {handled:true,text:'No pude comprobar o completar la reserva. Indica otra fecha y hora o inténtalo nuevamente.'}}
+  }
+  if(pending.kind==='appointment_cancel_selection'||pending.kind==='appointment_reschedule_selection'){
+    const choice=selectedOption(input,pending.appointments.length)
+    if(choice===null)return {handled:true,text:`Elige una cita:\n${pending.appointments.map((item,index)=>`${index+1}. ${item.label}`).join('\n')}`}
+    const selected=pending.appointments[choice]
+    if(pending.kind==='appointment_cancel_selection'){
+      const next:PendingIntent={kind:'appointment_cancel_confirmation',appointmentId:selected.id,label:selected.label,settingsVersion,timeZone:settings.appointmentTimeZone,expiresAt:pendingExpiry()}
+      await savePendingIntent(jid,{intent:next,sourceMessageId:messageId})
+      return {handled:true,text:`¿Confirmas que deseas cancelar esta cita? ${selected.label}. Responde “sí” o “no”.`}
+    }
+    const next:PendingIntent={kind:'appointment_details',operation:'reschedule',appointmentId:selected.id,settingsVersion,timeZone:settings.appointmentTimeZone,expiresAt:pendingExpiry()}
+    await savePendingIntent(jid,{intent:next,sourceMessageId:messageId})
+    return {handled:true,text:`Indica la nueva fecha y hora para reprogramar: ${selected.label}.`}
+  }
+  if(pending.kind==='appointment_cancel_confirmation'){
+    if(!isAffirmative(input))return {handled:true,text:`Confirma con “sí” para cancelar ${pending.label}, o responde “no”.`}
+    try{
+      if(!(await isTurnAuthorized(jid,settingsVersion)))return {handled:true,text:'La atención automática fue pausada. No realicé cambios.'}
+      const result=await cancelAppointmentById(jid,pending.appointmentId,`turn:${turnId}:pending-appointment-cancel`)
+      await clearPendingIntent(jid)
+      return result.status==='success'?{handled:true,text:`Cita cancelada: ${appointmentLabel(result.value,settings)}.`,actionApplied:true}:{handled:true,text:result.message}
+    }catch{return {handled:true,text:'No pude comprobar ni completar la cancelación. La cita no se confirmó como cancelada.'}}
+  }
+  if(pending.kind==='appointment_reschedule_confirmation'){
+    if(!isAffirmative(input))return {handled:true,text:`Confirma con “sí” para reprogramar ${pending.label} a ${pending.localStart}, o responde “no”.`}
+    try{
+      if(!(await isTurnAuthorized(jid,settingsVersion)))return {handled:true,text:'La atención automática fue pausada. No realicé cambios.'}
+      const local=resolveAppointmentStart(pending.localStart,{timeZone:settings.appointmentTimeZone,days:settings.appointmentDays,startTime:settings.appointmentStartTime,endTime:settings.appointmentEndTime,durationMinutes:settings.appointmentDurationMinutes})
+      const result=await rescheduleAppointmentForContact(jid,pending.appointmentId,local.toUTC().toJSDate(),local.plus({minutes:settings.appointmentDurationMinutes}).toUTC().toJSDate(),`turn:${turnId}:pending-appointment-reschedule`)
+      await clearPendingIntent(jid)
+      return result.status==='success'?{handled:true,text:`Cita reprogramada para ${appointmentLabel(result.value,settings)}.`,actionApplied:true}:{handled:true,text:result.message}
+    }catch{return {handled:true,text:'No pude comprobar ni completar la reprogramación. La cita conserva su horario anterior.'}}
+  }
+  return {handled:false}
+}
+
+async function recoverVerifiedEffect(turnId:number,jid:string,settings:AppSettings):Promise<string|null>{
+  const effect=await getConversationEffect(turnId)
+  if(!effect)return null
+  if(effect.effectKey.includes(':pending-'))await clearPendingIntent(jid)
+  if(effect.effectType.startsWith('cart:')){
+    const action=effect.effectType.slice(5) as 'add'|'remove'|'clear'|'show'
+    return formatVerifiedCart(effect.result.changed?{status:'success',value:{cart:effect.result.cart,changed:true}}:{status:'rejected',message:'No se pudo aplicar el cambio solicitado al carrito.'},action)
+  }
+  if(effect.effectType==='appointment:book'){
+    if(!effect.result.booked)return 'Ese horario ya está ocupado. Indica otra fecha y hora.'
+    const appointment=effect.result.appointment
+    return `Cita agendada para ${appointmentLabel({startsAt:new Date(appointment.startsAt),serviceRequested:appointment.serviceRequested??null},settings)}. No se realizó ningún cobro.`
+  }
+  if(effect.effectType==='appointment:cancel'){
+    return effect.result.status==='success'?`Cita cancelada: ${appointmentLabel({...effect.result.value,startsAt:new Date(effect.result.value.startsAt)},settings)}.`:effect.result.message
+  }
+  if(effect.effectType==='appointment:reschedule'){
+    return effect.result.status==='success'?`Cita reprogramada para ${appointmentLabel({...effect.result.value,startsAt:new Date(effect.result.value.startsAt)},settings)}.`:effect.result.message
+  }
+  return null
+}
+
+async function processAutoReply(current:ReturnType<typeof makeWASocket>,message:WAMessage):Promise<void>{
+  const jid=message.key.remoteJid!
+  const messageId=message.key.id!
+  const snapshot=runtimeSnapshot
+  const claimed=await claimConversationTurn(jid,messageId,snapshot.version)
+  if(!claimed.claimed){
+    if(['send_pending','uncertain'].includes(claimed.turn.status)){await sendPreparedTurn(current,claimed.turn,message,jid);return}
+    else if(['received','processing','action_applied'].includes(claimed.turn.status)){
+      const recovered=await recoverVerifiedEffect(claimed.turn.id,jid,snapshot.settings)
+      if(recovered){const outboundMessageId=stableOutboundId(jid,messageId);await prepareConversationReply(claimed.turn.id,'recovered_action',recovered,outboundMessageId,true);await sendPreparedTurn(current,{id:claimed.turn.id,settingsVersion:claimed.turn.settingsVersion,outcomeKind:'recovered_action',outboundText:recovered,outboundMessageId},message,jid);return}
+      if(claimed.turn.status==='action_applied')return
+      await resumeConversationTurn(claimed.turn.id,snapshot.version)
+      claimed.turn.settingsVersion=snapshot.version
+    }else{
+      return
+    }
+  }
+  const turn=claimed.turn
+  if(!attemptRateLimiter.consume(jid,Math.max(10,snapshot.settings.maxRepliesPerHour*3))){await markConversationTurnFailed(turn.id,'attempt_limit');return}
+  try{if(await isChatBotPaused(jid)){await markConversationTurnFailed(turn.id,'chat_paused');return}}catch{await markConversationTurnFailed(turn.id,'pause_check_failed');return}
+  await wait(snapshot.settings.replyDelayMs)
+  if(stopping||!serviceEnabled||socket!==current){await markConversationTurnFailed(turn.id,'service_stopped');return}
+  const input=normalizeMessage(message).text?.trim()
+  let answer=personalizeFixedResponse(snapshot.settings.responseText,snapshot.settings)
+  let outcome='fixed_reply'
+  let actionApplied=false
+  if(snapshot.settings.responseMode==='deepseek'){
+    if(!input){answer='No pude interpretar contenido de texto en ese mensaje.';outcome='missing_information'}
+    else{
+      const pending=await resolvePendingIntent(jid,messageId,input,snapshot.settings,snapshot.version,turn.id)
+      if(pending.handled){answer=pending.text!;actionApplied=!!pending.actionApplied;outcome=actionApplied?'action_applied':'pending_intent'}
+      else{
+        try{
+          const inventory=await listActiveInventory()
+          const cart=await getShoppingCart(jid)
+          let databaseHistory:Awaited<ReturnType<typeof getRecentConversation>>=[]
+          if(databaseEnabled)try{databaseHistory=await getRecentConversation(jid,messageId,12)}catch{databaseHistory=[]}
+          const history=mergeConversationTurns(databaseHistory,conversationMemory.get(jid),messageId,12)
+          const tone={friendly:'amable y cercano',professional:'profesional y claro',formal:'formal y respetuoso'}[snapshot.settings.aiTone]
+          const length={brief:'contesta en 1-2 frases',balanced:'contesta con el detalle necesario',detailed:'ofrece detalle cuando sea útil'}[snapshot.settings.aiResponseLength]
+          const instructions=`El bot se llama ${snapshot.settings.botName} y representa a ${snapshot.settings.businessName}. Tono ${tone}; ${length}. Políticas explícitas del negocio: ${snapshot.settings.aiSystemInstructions}`
+          const generated=await generateDeepSeekResponse(snapshot.settings.deepseekApiKey,snapshot.settings.deepseekModel,input,inventory,cart,snapshot.settings.transferEnabled,appointmentPromptSettings(snapshot.settings),history,instructions)
+          if(!(await isTurnAuthorized(jid,snapshot.version))){await markConversationTurnFailed(turn.id,'authorization_changed');return}
+          const explicitCatalog=detectCatalogRequest(input)
+          const catalogRequest=explicitCatalog??generated.catalogRequest
+          const paymentIntent=classifyPaymentIntent(input)
+          const existingPending=await getPendingIntent(jid)
+          const schedule={timeZone:snapshot.settings.appointmentTimeZone,days:snapshot.settings.appointmentDays,startTime:snapshot.settings.appointmentStartTime,endTime:snapshot.settings.appointmentEndTime,durationMinutes:snapshot.settings.appointmentDurationMinutes}
+          const relativeAppointment=resolveRelativeAppointmentText(input,schedule)
+          const proposedAppointmentStart=relativeAppointment.status==='resolved'?relativeAppointment.localStart:relativeAppointment.status==='none'?generated.appointmentStart:null
+          const appointmentIssue=relativeAppointment.status==='missing_time'||relativeAppointment.status==='ambiguous_time'?relativeAppointment.message:null
+
+          if(catalogRequest){
+            const all=await listActiveInventory(null)
+            const types=catalogRequest==='both'?['product','service'] as const:[catalogRequest==='products'?'product':'service'] as const
+            answer=types.map(type=>{
+              const items=all.filter(item=>item.itemType===type)
+              const title=type==='product'?'Productos':'Servicios'
+              if(!items.length)return `No hay ${title.toLowerCase()} activos en este momento.`
+              return `${title} disponibles:\n${items.map(item=>`• ${formatInventoryFact(item)}`).join('\n')}`
+            }).join('\n\n')
+            outcome='catalog_data'
+          }else if(generated.cartAction!=='none'){
+            const authorization=authorizeCartMutation(input,generated.cartAction,generated.cartItems,inventory,cart)
+            if(authorization.result.status==='success'){
+              if(!(await isTurnAuthorized(jid,snapshot.version))){await markConversationTurnFailed(turn.id,'authorization_changed_before_action');return}
+              const verified=await applyShoppingCartActionVerified(jid,authorization.result.value.action,authorization.result.value.items,`turn:${turn.id}:cart`)
+              answer=formatVerifiedCart(verified,authorization.result.value.action);actionApplied=verified.status==='success';outcome=actionApplied?'cart_applied':verified.status
+            }else{
+              answer=authorization.result.message
+              if(authorization.result.status==='ambiguous'&&authorization.candidates?.length){
+                const intent:PendingIntent={kind:'cart_selection',action:generated.cartAction==='remove'?'remove':'add',candidates:authorization.candidates,quantity:authorization.quantity??1,expiresAt:pendingExpiry()}
+                await savePendingIntent(jid,{intent,sourceMessageId:messageId})
+                answer+=`\n${authorization.result.options.join('\n')}`
+              }
+              outcome=authorization.result.status
+            }
+          }else if(generated.appointmentAction==='list'){
+            const upcoming=await getUpcomingAppointments(jid)
+            answer=upcoming.length?`Tus próximas citas:\n${upcoming.map(item=>`• ${appointmentLabel(item,snapshot.settings)}`).join('\n')}`:'No tienes citas futuras registradas.'
+            outcome='appointment_list'
+          }else if(generated.appointmentAction==='cancel'||generated.appointmentAction==='reschedule'){
+            const upcoming=await getUpcomingAppointments(jid)
+            if(!upcoming.length){answer='No tienes citas futuras activas para modificar.';outcome='rejected'}
+            else if(upcoming.length>1){
+              const appointments=upcoming.slice(0,5).map(item=>({id:item.id,label:appointmentLabel(item,snapshot.settings)}))
+              const intent:PendingIntent=generated.appointmentAction==='cancel'
+                ?{kind:'appointment_cancel_selection',appointments,settingsVersion:snapshot.version,timeZone:snapshot.settings.appointmentTimeZone,expiresAt:pendingExpiry()}
+                :{kind:'appointment_reschedule_selection',appointments,settingsVersion:snapshot.version,timeZone:snapshot.settings.appointmentTimeZone,expiresAt:pendingExpiry()}
+              await savePendingIntent(jid,{intent,sourceMessageId:messageId})
+              answer=`Elige una cita:\n${appointments.map((item,index)=>`${index+1}. ${item.label}`).join('\n')}`;outcome='ambiguous'
+            }else if(generated.appointmentAction==='cancel'){
+              const selected=upcoming[0],label=appointmentLabel(selected,snapshot.settings)
+              await savePendingIntent(jid,{intent:{kind:'appointment_cancel_confirmation',appointmentId:selected.id,label,settingsVersion:snapshot.version,timeZone:snapshot.settings.appointmentTimeZone,expiresAt:pendingExpiry()},sourceMessageId:messageId})
+              answer=`¿Confirmas que deseas cancelar esta cita? ${label}. Responde “sí” o “no”.`;outcome='confirmation_required'
+            }else{
+              const selected=upcoming[0],label=appointmentLabel(selected,snapshot.settings)
+              if(!proposedAppointmentStart){await savePendingIntent(jid,{intent:{kind:'appointment_details',operation:'reschedule',appointmentId:selected.id,settingsVersion:snapshot.version,timeZone:snapshot.settings.appointmentTimeZone,expiresAt:pendingExpiry()},sourceMessageId:messageId});answer=appointmentIssue??`Indica la nueva fecha y hora para reprogramar: ${label}.`;outcome='missing_information'}
+              else{
+                try{resolveAppointmentStart(proposedAppointmentStart,schedule)
+                  await savePendingIntent(jid,{intent:{kind:'appointment_reschedule_confirmation',appointmentId:selected.id,localStart:proposedAppointmentStart,label,settingsVersion:snapshot.version,timeZone:snapshot.settings.appointmentTimeZone,expiresAt:pendingExpiry()},sourceMessageId:messageId});answer=`¿Confirmas reprogramar ${label} a ${proposedAppointmentStart} (${snapshot.settings.appointmentTimeZone})? Responde “sí” o “no”.`;outcome='confirmation_required'
+                }catch(error:any){answer=`${error.message}. Indica otra fecha y hora.`;outcome='rejected'}
+              }
+            }
+          }else if(generated.appointmentAction==='book'||existingPending?.intent.kind==='appointment_details'&&existingPending.intent.operation==='book'){
+            if(!proposedAppointmentStart){await savePendingIntent(jid,{intent:{kind:'appointment_details',operation:'book',settingsVersion:snapshot.version,timeZone:snapshot.settings.appointmentTimeZone,expiresAt:pendingExpiry()},sourceMessageId:messageId});answer=appointmentIssue??`Indica fecha y hora completas. Horario: ${snapshot.settings.appointmentStartTime}–${snapshot.settings.appointmentEndTime} (${snapshot.settings.appointmentTimeZone}).`;outcome='missing_information'}
+            else{
+              try{resolveAppointmentStart(proposedAppointmentStart,schedule)
+                await savePendingIntent(jid,{intent:{kind:'appointment_book_confirmation',localStart:proposedAppointmentStart,service:generated.appointmentService,settingsVersion:snapshot.version,timeZone:snapshot.settings.appointmentTimeZone,expiresAt:pendingExpiry()},sourceMessageId:messageId});answer=`¿Confirmas la cita para ${proposedAppointmentStart} (${snapshot.settings.appointmentTimeZone})${generated.appointmentService?` — ${generated.appointmentService}`:''}? Responde “sí” o “no”.`;outcome='confirmation_required'
+              }catch(error:any){answer=`${error.message}. Indica otra fecha y hora.`;outcome='rejected'}
+            }
+          }else if(existingPending?.intent.kind==='appointment_details'&&existingPending.intent.operation==='reschedule'){
+            if(!proposedAppointmentStart){answer=appointmentIssue??'Indica una fecha y una hora completas para reprogramar.';outcome='missing_information'}
+            else{
+              const appointmentId=existingPending.intent.appointmentId!
+              await savePendingIntent(jid,{intent:{kind:'appointment_reschedule_confirmation',appointmentId,localStart:proposedAppointmentStart,label:'la cita seleccionada',settingsVersion:snapshot.version,timeZone:snapshot.settings.appointmentTimeZone,expiresAt:pendingExpiry()},sourceMessageId:messageId})
+              answer=`¿Confirmas reprogramar la cita seleccionada a ${proposedAppointmentStart} (${snapshot.settings.appointmentTimeZone})? Responde “sí” o “no”.`;outcome='confirmation_required'
+            }
+          }else if(paymentIntent==='request_transfer_details'){
+            answer=snapshot.settings.transferEnabled
+              ?[`Datos para transferencia:`,`Banco: ${snapshot.settings.transferBankName}`,`Titular: ${snapshot.settings.transferAccountHolder}`,snapshot.settings.transferClabe?`CLABE: ${snapshot.settings.transferClabe}`:'',snapshot.settings.transferAccountNumber?`Número de cuenta: ${snapshot.settings.transferAccountNumber}`:'',snapshot.settings.transferInstructions?`Instrucciones: ${snapshot.settings.transferInstructions}`:'','El envío de estos datos no confirma ningún pago.'].filter(Boolean).join('\n')
+              :'La transferencia no está habilitada. Consulta directamente al negocio los métodos disponibles.'
+            outcome='payment_information'
+          }else if(paymentIntent==='ask_methods'){
+            answer=snapshot.settings.transferEnabled?'Aceptamos transferencia. Si quieres los datos, pídeme explícitamente los datos de transferencia.':'Consulta directamente al negocio los métodos de pago disponibles.';outcome='payment_methods'
+          }else if(paymentIntent==='reported_paid'){
+            answer='Gracias por avisar. No puedo verificar ni confirmar la recepción del pago; el negocio debe comprobarlo.';outcome='payment_unverified'
+          }else if(paymentIntent==='declined_or_deferred'){
+            answer='Entendido. No compartí datos bancarios ni registré ningún pago.';outcome='payment_declined'
+          }else{
+            answer=verifiedInventoryAnswer(input,inventory)??safeConversationalReply(generated.text);outcome='ai_reply'
+          }
+        }catch{answer='No pude comprobar la información ni completar operaciones en este momento. Inténtalo nuevamente.';outcome='infrastructure_error'}
+      }
+    }
+  }
+  const outboundMessageId=stableOutboundId(jid,messageId)
+  await prepareConversationReply(turn.id,outcome,answer,outboundMessageId,actionApplied)
+  await sendPreparedTurn(current,{id:turn.id,settingsVersion:snapshot.version,outcomeKind:outcome,outboundText:answer,outboundMessageId},message,jid)
+}
+
 async function startSocket(): Promise<void> {
   if (stopping || !serviceEnabled || loggedOut || socket) return
   const { state, saveCreds } = await useMultiFileAuthState(config.authDir)
@@ -156,7 +435,7 @@ async function startSocket(): Promise<void> {
       logger.info('Escanea el QR desde WhatsApp > Dispositivos vinculados')
       qrcode.generate(update.qr, { small: true })
     }
-    if (update.connection === 'open') { reconnectAttempt = 0; serviceStatus = 'connected'; lastDisconnectCode = null; logger.info('WhatsApp conectado') }
+    if (update.connection === 'open') { reconnectAttempt = 0; serviceStatus = 'connected'; lastDisconnectCode = null; logger.info('WhatsApp conectado');void recoverConversationTurns(current).catch(()=>logger.error('No se pudieron recuperar respuestas pendientes')) }
     if (update.connection === 'close') {
       const disconnectError = update.lastDisconnect?.error as (Boom & Error) | undefined
       const reason = disconnectError?.output?.statusCode
@@ -211,154 +490,18 @@ async function startSocket(): Promise<void> {
     catch (error) { logger.error({ err: error }, 'Error procesando correspondencia LID-PN') }
   })
   current.ev.on('messages.upsert', async ({ messages, type }) => {
-    try {
-      for (const message of messages) {
-        if (type === 'notify' || message.key.fromMe) rememberLiveMessage(message)
+    const tasks=messages.map(async message=>{
+      try{
+        if(type==='notify'||message.key.fromMe)rememberLiveMessage(message)
         await enqueueMessage(message)
-        if (!replySettings.enabled || !shouldAutoReply(message, type, processStartedAtSeconds)) continue
-        const jid = message.key.remoteJid!
-        try { if (await isChatBotPaused(jid)) continue }
-        catch (error: any) { logger.error({ error: error.message }, 'No se pudo verificar la pausa por chat; no se responderá'); continue }
-        const dedupKey = `${jid}:${message.key.id}`
-        if (repliedMessageKeys.has(dedupKey)) continue
-        repliedMessageKeys.add(dedupKey)
-        if (!replyRateLimiter.consume(jid, replySettings.maxRepliesPerHour)) { logger.info('Respuesta omitida por límite por contacto/hora'); continue }
-        await wait(replySettings.delayMs)
-        if (stopping || !serviceEnabled || socket !== current) continue
-        let answer = personalizeFixedResponse(replySettings.text)
-        let recommendedSkus: string[] = []
-        let catalogRequest: CatalogRequest = null
-        let paymentRequest = false
-        let replyInventory: Awaited<ReturnType<typeof listActiveInventory>> = []
-        if (replySettings.mode === 'deepseek') {
-          const inputText = normalizeMessage(message).text
-          if (inputText) {
-            const explicitCatalogRequest = detectCatalogRequest(inputText)
-            try {
-              replyInventory = await listActiveInventory()
-              const inventoryReference = replyInventory.map(({ itemType, sku, name, description, price, currency, stockQuantity }) => ({ itemType, sku, name, description: description?.slice(0, 500) ?? null, price, currency, stockQuantity }))
-              const currentCart = await getShoppingCart(jid)
-              let databaseHistory: Awaited<ReturnType<typeof getRecentConversation>> = []
-              if (databaseEnabled) {
-                try { databaseHistory = await getRecentConversation(jid, message.key.id!, 12) }
-                catch (error: any) { logger.warn({ error: error.message }, 'No se pudo cargar el historial para DeepSeek; se usará el contexto de sesión') }
-              }
-              const conversation = mergeConversationTurns(databaseHistory, conversationMemory.get(jid), message.key.id!, 12)
-              const appointmentContext = {
-                ...appointmentSettings,
-                nowLocal: DateTime.now().setZone(appointmentSettings.timeZone).toFormat("yyyy-MM-dd'T'HH:mm"),
-              }
-              const toneInstructions = { friendly: 'amable y cercano', professional: 'profesional y claro', formal: 'formal y respetuoso' }[replySettings.aiTone]
-              const lengthInstructions = { brief: 'contesta en 1-2 frases, salvo que se solicite una lista completa', balanced: 'contesta en pocas frases con el detalle necesario', detailed: 'ofrece explicaciones detalladas cuando ayuden al cliente' }[replySettings.aiResponseLength]
-              const identityInstructions = `El bot se llama ${botIdentity.botName} y representa al negocio ${botIdentity.businessName}. Tono ${toneInstructions}; ${lengthInstructions}. ${replySettings.customInstructions}`
-              const generated = await generateDeepSeekResponse(replySettings.deepseekApiKey, replySettings.deepseekModel, inputText, inventoryReference, currentCart, transferSettings.enabled, appointmentContext, conversation, identityInstructions)
-              answer = generated.text
-              recommendedSkus = generated.productSkus
-              catalogRequest = explicitCatalogRequest ?? generated.catalogRequest
-              paymentRequest = generated.paymentRequest || detectPaymentRequest(inputText)
-              if (generated.cartAction !== 'none') {
-                const updatedCart = await applyShoppingCartAction(jid, generated.cartAction, generated.cartItems)
-                answer = `${answer}\n\n${formatCartSummary(generated.cartAction, updatedCart)}`
-              }
-              if (generated.appointmentAction !== 'none') {
-                if (generated.appointmentAction === 'list') {
-                  const upcoming = await getUpcomingAppointments(jid)
-                  answer = upcoming.length
-                    ? `Tus próximas citas:\n${upcoming.map(item => `• ${formatAppointmentLocal(item.startsAt, appointmentSettings.timeZone)}${item.serviceRequested ? ` — ${item.serviceRequested}` : ''}`).join('\n')}`
-                    : 'No tienes citas futuras registradas.'
-                } else if (generated.appointmentAction === 'cancel') {
-                  const cancelled = await cancelNextAppointment(jid)
-                  answer = cancelled
-                    ? `Cancelé tu próxima cita: ${formatAppointmentLocal(cancelled.startsAt, appointmentSettings.timeZone)}${cancelled.serviceRequested ? ` — ${cancelled.serviceRequested}` : ''}.`
-                    : 'No encontré citas futuras para cancelar.'
-                } else if (!generated.appointmentStart) {
-                  answer = `Para agendar, dime la fecha y hora que prefieres. Nuestro horario es ${appointmentSettings.startTime}–${appointmentSettings.endTime} (${appointmentSettings.timeZone}).`
-                } else {
-                  try {
-                    const localStart = resolveAppointmentStart(generated.appointmentStart, appointmentSettings)
-                    const startUtc = localStart.toUTC().toJSDate()
-                    const endUtc = localStart.plus({ minutes: appointmentSettings.durationMinutes }).toUTC().toJSDate()
-                    const result = await createAppointment(jid, startUtc, endUtc, generated.appointmentService)
-                    answer = result.booked
-                      ? `Cita agendada para ${localStart.setLocale('es').toFormat('cccc dd LLL yyyy, HH:mm')} (${appointmentSettings.timeZone}), duración ${appointmentSettings.durationMinutes} minutos${generated.appointmentService ? `, servicio: ${generated.appointmentService}` : ''}. No se realizó ningún cobro.`
-                      : 'Ese horario ya está ocupado. Dime otra fecha y hora para revisar disponibilidad.'
-                  } catch (error: any) {
-                    answer = `${error.message}. Dime otra fecha y hora para revisar disponibilidad.`
-                  }
-                }
-              }
-              if (catalogRequest) replyInventory = await listActiveInventory(null)
-            }
-            catch (error: any) { logger.warn({ error: error.message }, 'DeepSeek falló; se usará el texto alternativo configurado') }
-          } else logger.info('Mensaje sin texto; se usará el texto alternativo configurado')
-        }
-        if (transferSettings.enabled && paymentRequest) {
-          const details = [
-            `Banco: ${transferSettings.bankName}`,
-            `Titular: ${transferSettings.accountHolder}`,
-            transferSettings.clabe ? `CLABE: ${transferSettings.clabe}` : '',
-            transferSettings.accountNumber ? `Número de cuenta: ${transferSettings.accountNumber}` : '',
-            transferSettings.instructions ? `Referencia/instrucciones: ${transferSettings.instructions}` : '',
-          ].filter(Boolean).join('\n')
-          answer = `${answer}\n\nDatos para transferencia:\n${details}`
-        }
-        let catalogMessages: string[] = []
-        let catalogItemTypes: Array<'product' | 'service'> = []
-        if (catalogRequest) {
-          try {
-            const latestSettings = await loadAppSettings(defaultAppSettings)
-            generalCatalogImages = { products: latestSettings.productCatalogImageUrl, services: latestSettings.serviceCatalogImageUrl }
-          } catch (error: any) { logger.warn({ error: error.message }, 'No se pudieron actualizar las imágenes generales desde configuración') }
-          catalogItemTypes = catalogRequest === 'both' ? ['product', 'service'] : [catalogRequest === 'products' ? 'product' : 'service']
-          for (const itemType of catalogItemTypes) {
-            const items = replyInventory.filter(item => item.itemType === itemType)
-            const label = itemType === 'product' ? 'Productos' : 'Servicios'
-            const lines = items.map(item => {
-              const price = item.price === null ? 'precio a cotizar' : `${item.price} ${item.currency}`
-              const stock = item.itemType === 'product'
-                ? item.stockQuantity === 0 ? 'agotado' : item.stockQuantity === null ? 'existencias no controladas' : `existencias: ${item.stockQuantity}`
-                : ''
-              return `• ${item.name} — ${price}${stock ? ` — ${stock}` : ''}`
-            })
-            const text = items.length ? `${label} disponibles:\n${lines.join('\n')}` : `No hay ${label.toLowerCase()} activos en este momento.`
-            let chunk = ''
-            for (const line of text.split('\n')) {
-              if (chunk && `${chunk}\n${line}`.length > 3_500) { catalogMessages.push(chunk); chunk = line }
-              else chunk = chunk ? `${chunk}\n${line}` : line
-            }
-            if (chunk) catalogMessages.push(chunk)
-          }
-          if (catalogMessages.length) answer = catalogMessages.shift()!
-        }
-        if (stopping || !serviceEnabled || socket !== current) continue
-        const replyMessage = await current.sendMessage(jid, { text: answer }, { quoted: message })
-        if (replyMessage?.key.id) conversationMemory.remember(jid, { id: replyMessage.key.id, role: 'assistant', content: answer, timestampMs: Date.now() })
-        if (catalogRequest) {
-          for (const text of catalogMessages) {
-              const catalogMessage = await current.sendMessage(jid, { text }, { quoted: message })
-              if (catalogMessage?.key.id) conversationMemory.remember(jid, { id: catalogMessage.key.id, role: 'assistant', content: text, timestampMs: Date.now() })
-          }
-          for (const itemType of catalogItemTypes) {
-            const label = itemType === 'product' ? 'productos' : 'servicios'
-            const imageUrl = itemType === 'product' ? generalCatalogImages.products : generalCatalogImages.services
-            if (imageUrl) {
-              try { await current.sendMessage(jid, { image: { url: imageUrl }, caption: `Catálogo de ${botIdentity.businessName} — ${label.toLowerCase()}` }, { quoted: message }) }
-              catch (error: any) { logger.warn({ error: error.message }, 'No se pudo enviar la imagen general del catálogo') }
-            }
-          }
-        }
-        if (replySettings.mode === 'deepseek' && !catalogRequest && recommendedSkus.length) {
-          for (const sku of recommendedSkus.slice(0, 2)) {
-            const item = replyInventory.find(candidate => candidate.sku === sku && candidate.imageUrl)
-            if (!item?.imageUrl || stopping || !serviceEnabled || socket !== current) continue
-            try { await current.sendMessage(jid, { image: { url: item.imageUrl }, caption: item.name }, { quoted: message }) }
-            catch (error: any) { logger.warn({ error: error.message }, 'No se pudo enviar una imagen de producto') }
-          }
-        }
-        logger.info({ delayMs: replySettings.delayMs }, 'Respuesta de prueba enviada')
-      }
-    }
-    catch (error) { logger.error({ err: error }, 'Error procesando messages.upsert') }
+        if(!runtimeSnapshot.settings.autoReply||!shouldAutoReply(message,type,processStartedAtSeconds))return
+        const normalized=normalizeMessage(message)
+        if(normalized.deleted||normalized.type==='protocolMessage')return
+        const jid=message.key.remoteJid!
+        await chatExecutor.run(jid,()=>processAutoReply(current,message))
+      }catch{logger.error('Error procesando un mensaje entrante; se continuará con los demás')}
+    })
+    await Promise.allSettled(tasks)
   })
   current.ev.on('messages.update', async updates => {
     try {
@@ -384,70 +527,38 @@ async function startSocket(): Promise<void> {
   })
 }
 
+async function applyRuntimeSettings(settings:AppSettings):Promise<void>{
+  runtimeSnapshot={version:settingsVersion(settings),settings:structuredClone(settings)}
+  databaseEnabled = settings.saveToDatabase
+  if(retentionTimer){clearInterval(retentionTimer);retentionTimer=undefined}
+  if(serviceEnabled&&(databaseEnabled||settings.autoReply)){
+    if(databaseEnabled){
+      if(!queueInitialized){await queue.initialize();queueInitialized=true}
+      void queue.drain()
+    }
+    if(settings.messageRetentionDays>0){
+      const revision=runtimeSnapshot.version
+      const cleanup=async()=>{if(runtimeSnapshot.version!==revision)return;try{const removed=await deleteMessagesOlderThan(settings.messageRetentionDays);conversationMemory.pruneOlderThan(Date.now()-settings.messageRetentionDays*86400000);logger.info({removed},'Limpieza de retención completada')}catch{logger.error('Falló la limpieza de retención')}}
+      await cleanup();retentionTimer=setInterval(()=>{void cleanup()},86400000);retentionTimer.unref()
+    }
+  }
+}
+
 async function startConfiguredService(settings: AppSettings): Promise<void> {
   if (serviceEnabled || socket) throw new Error('El servicio de WhatsApp ya está iniciado')
   stopping = false
   loggedOut = false
   serviceEnabled = true
   serviceStatus = 'connecting'
-  databaseEnabled = settings.saveToDatabase
-  botIdentity = { botName: settings.botName, businessName: settings.businessName }
-  replySettings = {
-    enabled: settings.autoReply,
-    mode: settings.responseMode,
-    text: settings.responseText,
-    delayMs: settings.replyDelayMs,
-    deepseekApiKey: settings.deepseekApiKey,
-    deepseekModel: settings.deepseekModel,
-    aiTone: settings.aiTone,
-    aiResponseLength: settings.aiResponseLength,
-    customInstructions: settings.aiSystemInstructions,
-    maxRepliesPerHour: settings.maxRepliesPerHour,
-  }
-  generalCatalogImages = { products: settings.productCatalogImageUrl, services: settings.serviceCatalogImageUrl }
-  transferSettings = {
-    enabled: settings.transferEnabled,
-    bankName: settings.transferBankName,
-    accountHolder: settings.transferAccountHolder,
-    accountNumber: settings.transferAccountNumber,
-    clabe: settings.transferClabe,
-    instructions: settings.transferInstructions,
-  }
-  appointmentSettings = {
-    enabled: settings.appointmentsEnabled,
-    timeZone: settings.appointmentTimeZone,
-    days: settings.appointmentDays,
-    startTime: settings.appointmentStartTime,
-    endTime: settings.appointmentEndTime,
-    durationMinutes: settings.appointmentDurationMinutes,
-    nowLocal: '',
-  }
+  await applyRuntimeSettings(settings)
   processStartedAtSeconds = Math.ceil(Date.now() / 1000)
-  repliedMessageKeys.clear()
   replyRateLimiter.clear()
+  attemptRateLimiter.clear()
   try {
     const needsDatabase = databaseEnabled || settings.autoReply
     if (needsDatabase) {
       await pool.query('SELECT 1')
       logger.info('Conexión MySQL verificada')
-      if (databaseEnabled) {
-        if (!queueInitialized) { await queue.initialize(); queueInitialized = true }
-        void queue.drain()
-        if (retentionTimer) clearInterval(retentionTimer)
-        if (settings.messageRetentionDays > 0) {
-          const cleanup = async () => {
-            try {
-              const removed = await deleteMessagesOlderThan(settings.messageRetentionDays)
-              conversationMemory.pruneOlderThan(Date.now() - settings.messageRetentionDays * 24 * 60 * 60 * 1000)
-              logger.info({ removed }, 'Limpieza de retención completada')
-            }
-            catch (error: any) { logger.error({ error: error.message }, 'Falló la limpieza de retención') }
-          }
-          await cleanup()
-          retentionTimer = setInterval(() => { void cleanup() }, 24 * 60 * 60 * 1000)
-          retentionTimer.unref()
-        }
-      }
     }
     try {
       const latest = await fetchLatestBaileysVersion()
@@ -488,16 +599,18 @@ async function sendManualMessage(contactId: number, text: string): Promise<void>
 }
 
 async function deleteContact(contactId: number): Promise<boolean> {
-  const data = await exportContactData(contactId)
-  if (!data) return false
-  const identifiers = data.identifiers as Array<{ jid: string }>
-  for (const identifier of identifiers) {
-    conversationMemory.clear(identifier.jid)
-    knownNames.delete(identifier.jid)
-    replyRateLimiter.forget(identifier.jid)
-    for (const key of repliedMessageKeys) if (key.startsWith(`${identifier.jid}:`)) repliedMessageKeys.delete(key)
-  }
-  return deleteContactData(contactId)
+  const identifiers=await getContactIdentifiers(contactId)
+  if(!identifiers.length)return false
+  const jids=[...new Set(identifiers.map(item=>item.jid))].sort()
+  await queue.suppressAndDiscard(jids)
+  const runLocked=async(index:number):Promise<boolean>=>index===jids.length
+    ?deleteContactData(contactId)
+    :chatExecutor.run(jids[index],()=>runLocked(index+1))
+  try{
+    const deleted=await runLocked(0)
+    if(deleted)for(const jid of jids){conversationMemory.clear(jid);knownNames.delete(jid);replyRateLimiter.forget(jid);attemptRateLimiter.forget(jid)}
+    return deleted
+  }finally{queue.releaseJids(jids)}
 }
 
 async function shutdown(signal: string): Promise<void> {
@@ -516,8 +629,10 @@ async function shutdown(signal: string): Promise<void> {
 
 async function main(): Promise<void> {
   const initialSettings = await loadAppSettings(defaultAppSettings)
+  await applyRuntimeSettings(initialSettings)
   configServer = await launchConfigUi(initialSettings, {
     start: startConfiguredService,
+    applySettings: applyRuntimeSettings,
     logout: logoutWhatsApp,
     sendManualMessage,
     deleteContact,
