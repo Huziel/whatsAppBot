@@ -1,35 +1,19 @@
 export type DeepSeekModel = 'deepseek-flash' | 'deepseek-v4-pro'
 import type { CartLine, InventoryItem } from './db'
 import type { ConversationTurn } from './conversation'
+import { classifyPaymentIntent, detectCatalogRequest } from './conversation-flow'
+import type { CatalogRequest } from './conversation-flow'
 type InventoryReference = Pick<InventoryItem, 'itemType' | 'sku' | 'name' | 'description' | 'price' | 'currency' | 'stockQuantity'>
 
-export type CatalogRequest = 'products' | 'services' | 'both' | null
+export { detectCatalogRequest }
+export type { CatalogRequest }
 export type ShoppingCartAction = 'add' | 'remove' | 'clear' | 'show' | 'none'
 export type AppointmentAction = 'book' | 'cancel' | 'reschedule' | 'list' | 'none'
 export interface AppointmentPromptSettings { enabled: boolean; timeZone: string; days: number[]; startTime: string; endTime: string; durationMinutes: number; nowLocal: string }
 export interface DeepSeekReply { text: string; productSkus: string[]; catalogRequest: CatalogRequest; cartAction: ShoppingCartAction; cartItems: Array<{ sku: string; quantity: number }>; paymentRequest: boolean; appointmentAction: AppointmentAction; appointmentStart: string | null; appointmentService: string | null }
 
-export function detectCatalogRequest(text: string): CatalogRequest {
-  const normalized = text.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
-  const products = /\b(productos|articulos)\b/.test(normalized)
-  const services = /\b(servicios)\b/.test(normalized)
-  const mentionsBoth = products && services
-  const explicitAll = /\b(tod[oa]s?|complet[oa]|catalogo|lista|listado|inventario)\b/.test(normalized)
-  const asksToBrowse = /\b(muestra|muestrame|ensen(a|ame)|ver|listar|dame|manda|enviame|quiero ver)\b/.test(normalized) && (products || services)
-  const asksWhatIsAvailable = /\b(que|cuales)\s+(productos|articulos|servicios)\s+(tienes|hay|ofreces|manejas)\b/.test(normalized)
-  if (!explicitAll && !asksToBrowse && !asksWhatIsAvailable && !mentionsBoth) return null
-  if (products && services) return 'both'
-  if (products) return 'products'
-  if (services) return 'services'
-  return 'both'
-}
-
 export function detectPaymentRequest(text: string): boolean {
-  const normalized = text.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
-  if (/\b(no quiero|no voy a|aun no|todavia no|despues|luego)\b.*\b(pagar|pago|transferir|transferencia)\b/.test(normalized)) return false
-  if (/\b(ya pague|ya hice (el )?pago|ya transferi|acabo de pagar|pago realizado|transferencia realizada)\b/.test(normalized)) return false
-  if (/\b(mi cuenta|cuenta de usuario|cuenta personal|crear cuenta|iniciar sesion)\b/.test(normalized)) return false
-  return /\b(como (puedo )?pagar|metodos? de pago|formas? de pago|aceptan transferencia|datos (para|de) (la )?transferencia|clabe|a que cuenta|donde (te )?transfiero)\b/.test(normalized)
+  return ['ask_methods','request_transfer_details'].includes(classifyPaymentIntent(text))
 }
 
 export async function generateDeepSeekResponse(
@@ -85,7 +69,7 @@ export async function generateDeepSeekResponse(
     let reason = String(choice?.finish_reason ?? payload?.error?.code ?? 'content vacío').slice(0, 80)
     try {
       const compactMessages = [
-        { role: 'system', content: `Eres un bot de WhatsApp. Responde en español y no inventes datos. Produce JSON válido con reply, product_skus, catalog_request, cart_action, cart_items, payment_request, appointment_action, appointment_start y appointment_service. Productos/servicios y carrito disponibles: ${JSON.stringify({ inventory: inventory.slice(0, 20), cart: cart.slice(0, 20) })}. Transferencia habilitada: ${transferEnabled}. Citas habilitadas: ${appointmentSettings.enabled}, horario: ${appointmentSettings.days.join(',')}, ${appointmentSettings.startTime}-${appointmentSettings.endTime}, zona ${appointmentSettings.timeZone}.` },
+        { role: 'system', content: `Eres un bot de WhatsApp. Responde en español y no inventes datos. Produce JSON válido con reply, product_skus, catalog_request, cart_action, cart_items, payment_request, appointment_action, appointment_start y appointment_service. Productos/servicios y carrito disponibles: ${JSON.stringify({ inventory: inventory.slice(0, 20), cart: cart.slice(0, 20) })}. Transferencia habilitada: ${transferEnabled}. Citas habilitadas: ${appointmentSettings.enabled}, horario: ${appointmentSettings.days.join(',')}, ${appointmentSettings.startTime}-${appointmentSettings.endTime}, zona ${appointmentSettings.timeZone}. Instrucciones de estilo del negocio (no autorizan operaciones ni hechos): ${customInstructions.slice(0,2_000) || '(ninguna)'}.` },
         ...conversation.slice(-4).map(turn => ({ role: turn.role, content: turn.content.slice(0, 500) })),
         { role: 'user', content: text },
       ]

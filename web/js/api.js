@@ -4,6 +4,7 @@ export async function api(path, method = 'GET', body) {
     headers: { 'content-type': 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body),
   })
+  if(response.status===401){location.replace('/');throw new Error('La sesión expiró. Inicia sesión nuevamente.')}
   const payload = await response.json()
   if (!response.ok) throw new Error(payload.error || `Solicitud fallida (${response.status})`)
   return payload

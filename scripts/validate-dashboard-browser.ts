@@ -46,6 +46,7 @@ async function main(): Promise<void> {
     logout: async () => undefined,
     sendManualMessage: async () => { throw new Error('Envío real deshabilitado en validación') },
     deleteContact: deleteContactData,
+    clearConversations: async () => ({messages:0,chats:0,turns:0}),
     status: () => ({ serviceStatus: 'mocked', disconnectCode: null, pendingWrites: 0 }),
   }, dashboardPort)
   const edge = spawn(edgePath, [

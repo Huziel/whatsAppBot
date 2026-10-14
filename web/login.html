@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#060B09">
+  <title>Acceso — WhatsApp Bot</title>
+  <link rel="stylesheet" href="/assets/dashboard.css">
+</head>
+<body class="bg-grid-glow">
+  <main class="grid min-h-screen place-items-center px-4 py-10">
+    <section class="glass-panel w-full max-w-md p-7 sm:p-9">
+      <div class="mb-7 flex items-center gap-3">
+        <span class="grid h-12 w-12 place-items-center rounded-2xl border border-whatsapp/30 bg-whatsapp/10 text-xl font-black text-whatsapp shadow-glow">W</span>
+        <div><p class="eyebrow">WHATSAPP BOT</p><h1 class="mt-1 text-xl font-semibold">Centro de control</h1></div>
+      </div>
+      <h2 id="loginTitle" class="section-title">Iniciar sesión</h2>
+      <p id="loginDescription" class="section-copy">Ingresa tus credenciales para administrar el dashboard.</p>
+      <form id="loginForm" class="mt-6 space-y-4">
+        <div><label class="field-label" for="username">Usuario</label><input id="username" class="control" type="text" minlength="3" maxlength="64" autocomplete="username" required></div>
+        <div><label id="passwordLabel" class="field-label" for="password">Contraseña</label><input id="password" class="control" type="password" minlength="12" maxlength="1024" autocomplete="current-password" required></div>
+        <div id="confirmWrap" class="hidden"><label class="field-label" for="confirmPassword">Confirmar contraseña</label><input id="confirmPassword" class="control" type="password" minlength="12" maxlength="1024" autocomplete="new-password"></div>
+        <div id="loginError" class="hidden rounded-xl border border-danger/25 bg-danger/10 px-4 py-3 text-sm text-red-100" role="alert"></div>
+        <button id="loginSubmit" class="btn-primary w-full" type="submit">Entrar al dashboard</button>
+      </form>
+      <p class="mt-6 text-xs leading-5 text-muted">Acceso local protegido. La contraseña se guarda como hash y la sesión usa una cookie HttpOnly.</p>
+    </section>
+  </main>
+  <script type="module" src="/js/login.js?v=2"></script>
+</body>
+</html>

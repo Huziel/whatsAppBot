@@ -31,9 +31,14 @@ export function timestampDate(timestamp: unknown): Date {
   return new Date(seconds * 1000)
 }
 
+export function isMessageAtOrAfterStart(timestamp:unknown,startedAtSeconds:number):boolean{
+  const seconds=timestampDate(timestamp).getTime()/1000
+  return Number.isFinite(startedAtSeconds)&&seconds>=startedAtSeconds
+}
+
 export function shouldAutoReply(message: any, upsertType: string, processStartedAtSeconds: number): boolean {
   const jid = message?.key?.remoteJid
-  if (upsertType !== 'notify' || message?.key?.fromMe || !message?.key?.id || !isIndividualJid(jid) || !message?.message) return false
+  if (!['notify','append'].includes(upsertType) || message?.key?.fromMe || !message?.key?.id || !isIndividualJid(jid) || !message?.message) return false
   const timestampSeconds = timestampDate(message.messageTimestamp).getTime() / 1000
   return timestampSeconds >= processStartedAtSeconds
 }

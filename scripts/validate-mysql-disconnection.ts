@@ -19,6 +19,7 @@ async function main(): Promise<void> {
   const server = await launchDashboardServer(fallback, {
     start: async () => undefined, logout: async () => undefined, sendManualMessage: async () => undefined,
     deleteContact: async () => false,
+    clearConversations: async () => ({messages:0,chats:0,turns:0}),
     status: () => ({ serviceStatus: 'mocked', disconnectCode: null, pendingWrites: 0 }),
   }, 3102)
   try {

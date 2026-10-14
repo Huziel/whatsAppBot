@@ -62,7 +62,7 @@ export function initializeSettings(){
   archiveLabel.textContent='Archivar contactos y mensajes en MySQL'
   const archiveNote=document.createElement('p')
   archiveNote.className='mt-1 text-xs text-muted'
-  archiveNote.textContent='Con el autoresponder activo se conservan metadatos operativos y respuestas cifradas para evitar acciones duplicadas y recuperar envíos.'
+  archiveNote.textContent='Solo se guardan mensajes nuevos recibidos desde que se inicia WhatsApp. No se importa el historial anterior. Se conservan datos operativos cifrados para evitar acciones duplicadas y recuperar envíos.'
   archiveLabel.parentElement.after(archiveNote)
   for(const selector of ['#botName','#businessName','#autoReply','#responseMode','#responseText','#delay','#saveToDatabase','#deepseekModel','#aiTone','#aiResponseLength','#aiSystemInstructions','#maxRepliesPerHour','#messageRetentionDays','#productCatalogImageUrl','#serviceCatalogImageUrl','#transferEnabled','#transferBankName','#transferAccountHolder','#transferAccountNumber','#transferClabe','#transferInstructions','#appointmentsEnabled','#appointmentTimeZone','#appointmentStartTime','#appointmentEndTime','#appointmentDurationMinutes','#deepseekApiKey','#clearDeepseekApiKey']){
     const element=document.querySelector(selector);element.addEventListener('input',()=>setDirty(true));element.addEventListener('change',()=>setDirty(true))
@@ -73,4 +73,16 @@ export function initializeSettings(){
   $('serviceCatalogImageUrl').addEventListener('input',updateCatalogPreviews)
   $('saveSettingsTop').addEventListener('click',()=>void saveSettings())
   $('saveSettingsMobile').addEventListener('click',()=>void saveSettings())
+  $('clearConversations').addEventListener('click',clearConversationHistory)
+}
+
+async function clearConversationHistory(){
+  const confirmation=window.prompt('Esta acción elimina todos los mensajes y chats, turnos pendientes y datos de recuperación. Los contactos, ventas, citas, catálogo y configuración se conservan. Escribe VACIAR para continuar.')
+  if(confirmation!=='VACIAR')return
+  const button=$('clearConversations');button.disabled=true;$('clearConversationsNotice').textContent='Vaciando historial…'
+  try{
+    const result=await api('/api/conversations/clear','POST',{confirm:'VACIAR'})
+    $('clearConversationsNotice').textContent=`${result.message} Se eliminaron ${result.messages} mensajes y ${result.chats} chats. Los contactos se conservaron.`
+  }catch(error){$('clearConversationsNotice').textContent=error.message}
+  finally{button.disabled=false}
 }

@@ -9,6 +9,17 @@ import { decryptLocalValue, encryptLocalValue } from './settings-crypto'
 export const pool: Pool = mysql.createPool({ ...config.db, waitForConnections: true, connectionLimit: 8, queueLimit: 0, charset: 'utf8mb4', timezone: 'Z', dateStrings: false })
 pool.on('connection', connection => { connection.query("SET time_zone = '+00:00'") })
 
+export async function assertConversationEngineSchema():Promise<void>{
+  const [rows]:any=await pool.query(`SELECT COLUMN_NAME AS columnName,COLUMN_TYPE AS columnType
+    FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='conversation_turns'
+      AND COLUMN_NAME IN ('status','recovery_token','recovery_lease_until')`)
+  const columns=new Map<string,string>(rows.map((row:any)=>[String(row.columnName),String(row.columnType)] as [string,string]))
+  if(!columns.has('recovery_token')||!columns.has('recovery_lease_until')||!columns.get('status')?.includes("'sending'")){
+    throw new Error('El esquema conversacional está desactualizado. Ejecuta npm run migrate antes de iniciar WhatsApp.')
+  }
+}
+
 export interface StoredMessage {
   jid: string; lid?: string | null; phoneJid?: string | null; displayName?: string | null
   waMessageId: string; fromMe: boolean; senderJid?: string | null; messageType: string
@@ -22,11 +33,11 @@ export interface InventoryItemInput {
 
 export interface InventoryItem extends InventoryItemInput { id: number }
 export interface CartLine { sku: string; itemType: 'product' | 'service'; itemName: string; quantity: number; unitPrice: string | null; currency: string }
-export interface CartChange { sku: string; quantity: number }
+export interface CartChange { sku: string; quantity: number; removeAll?: boolean }
 export type CartAction = 'add' | 'remove' | 'clear' | 'show' | 'none'
 export interface AppointmentRecord { id: number; startsAt: Date; endsAt: Date; serviceRequested: string | null }
 export interface StoredConversationEntry { id: string; role: 'user' | 'assistant'; content: string; timestampMs: number }
-export type ConversationTurnStatus = 'received'|'processing'|'action_applied'|'send_pending'|'sent'|'failed'|'uncertain'
+export type ConversationTurnStatus = 'received'|'processing'|'action_applied'|'send_pending'|'sending'|'sent'|'failed'|'uncertain'
 export interface ConversationTurnRecord { id: number; jid: string; waMessageId: string; status: ConversationTurnStatus; settingsVersion: number; outcomeKind: string | null; outboundText: string | null; outboundMessageId: string | null; sendAttempts: number }
 
 const inventoryColumns = 'id,item_type AS itemType,sku,name,description,image_url AS imageUrl,price,currency,stock_quantity AS stockQuantity,is_active AS isActive'
@@ -106,7 +117,12 @@ export async function applyShoppingCartAction(jid: string, action: CartAction, i
     const beforeCart=beforeRows.map((row:any)=>({...row,quantity:Number(row.quantity)}))
     if (action === 'clear') await conn.query('DELETE FROM shopping_cart_items WHERE cart_id=?', [cart.id])
     if (action === 'remove') {
-      for (const item of items) if (typeof item.sku === 'string') await conn.query('DELETE FROM shopping_cart_items WHERE cart_id=? AND sku=?', [cart.id, item.sku])
+      for (const item of items) if (typeof item.sku === 'string'&&Number.isInteger(item.quantity)&&item.quantity>0) {
+        const [[current]]:any=await conn.query('SELECT quantity FROM shopping_cart_items WHERE cart_id=? AND sku=? FOR UPDATE',[cart.id,item.sku])
+        if(!current)continue
+        if(item.removeAll||item.quantity>=Number(current.quantity))await conn.query('DELETE FROM shopping_cart_items WHERE cart_id=? AND sku=?',[cart.id,item.sku])
+        else await conn.query('UPDATE shopping_cart_items SET quantity=quantity-? WHERE cart_id=? AND sku=?',[item.quantity,cart.id,item.sku])
+      }
     }
     if (action === 'add') {
       for (const item of items) {
@@ -434,6 +450,12 @@ export async function listOrders(): Promise<any[]> {
   return [...orders.values()]
 }
 
+export async function listOrdersForContact(jid:string):Promise<Array<{id:number;status:string;total:string|null;currency:string|null}>>{
+  const [rows]:any=await pool.execute(`SELECT o.id,o.status,o.total,o.currency FROM orders o
+    JOIN contact_identifiers i ON i.contact_id=o.contact_id WHERE i.jid=? ORDER BY o.created_at DESC LIMIT 10`,[jid])
+  return rows.map((row:any)=>({...row,id:Number(row.id),total:row.total===null?null:String(row.total),currency:row.currency??null}))
+}
+
 export async function setOrderStatus(orderId: number, status: 'confirmed' | 'cancelled'): Promise<boolean> {
   const [result]: any = await pool.execute('UPDATE orders SET status=? WHERE id=? AND status=\'pending\'', [status,orderId])
   return result.affectedRows > 0
@@ -478,32 +500,82 @@ export async function claimConversationTurn(jid: string, waMessageId: string, se
   return {claimed,turn:conversationTurnRow(row)}
 }
 
-export async function prepareConversationReply(turnId: number, outcomeKind: string, text: string, outboundMessageId: string, actionApplied=false): Promise<void> {
-  if(actionApplied)await pool.execute("UPDATE conversation_turns SET status='action_applied',outcome_kind=? WHERE id=?",[outcomeKind,turnId])
-  await pool.execute("UPDATE conversation_turns SET status='send_pending',outcome_kind=?,outbound_text=?,outbound_message_id=?,last_error_code=NULL WHERE id=?",[outcomeKind,encryptLocalValue(text),outboundMessageId,turnId])
+export async function prepareConversationReply(turnId: number, outcomeKind: string, text: string, outboundMessageId: string, actionApplied=false, recoveryToken?:string): Promise<boolean> {
+  const ownership=recoveryToken?' AND recovery_token=? AND recovery_lease_until>=UTC_TIMESTAMP(3)':' AND recovery_token IS NULL'
+  const allowed=actionApplied?"('processing','action_applied')":"('received','processing','action_applied')"
+  const [result]:any=await pool.execute(`UPDATE conversation_turns SET status='send_pending',outcome_kind=?,outbound_text=?,outbound_message_id=?,last_error_code=NULL WHERE id=? AND status IN ${allowed}${ownership}`,
+    recoveryToken?[outcomeKind,encryptLocalValue(text),outboundMessageId,turnId,recoveryToken]:[outcomeKind,encryptLocalValue(text),outboundMessageId,turnId])
+  return result.affectedRows===1
 }
 
-export async function markConversationTurnSent(turnId: number): Promise<void> {
-  await pool.execute("UPDATE conversation_turns SET status='sent',send_attempts=send_attempts+1,last_error_code=NULL WHERE id=?",[turnId])
+export async function markConversationTurnSent(turnId: number,recoveryToken?:string): Promise<void> {
+  await pool.execute(`UPDATE conversation_turns SET status='sent',send_attempts=send_attempts+1,last_error_code=NULL,recovery_token=NULL,recovery_lease_until=NULL WHERE id=? AND status='sending'${recoveryToken?' AND recovery_token=?':' AND recovery_token IS NULL'}`,recoveryToken?[turnId,recoveryToken]:[turnId])
 }
 
-export async function markConversationTurnUncertain(turnId: number, code='send_uncertain'): Promise<void> {
-  await pool.execute("UPDATE conversation_turns SET status='uncertain',send_attempts=send_attempts+1,last_error_code=? WHERE id=?",[code.slice(0,80),turnId])
+export async function markConversationTurnUncertain(turnId: number, code='send_uncertain',recoveryToken?:string): Promise<void> {
+  await pool.execute(`UPDATE conversation_turns SET status='uncertain',send_attempts=send_attempts+1,last_error_code=?,recovery_token=NULL,recovery_lease_until=NULL WHERE id=? AND status='sending'${recoveryToken?' AND recovery_token=?':' AND recovery_token IS NULL'}`,recoveryToken?[code.slice(0,80),turnId,recoveryToken]:[code.slice(0,80),turnId])
 }
 
-export async function markConversationTurnFailed(turnId: number, code: string): Promise<void> {
-  await pool.execute("UPDATE conversation_turns SET status='failed',last_error_code=? WHERE id=?",[code.slice(0,80),turnId])
+export async function markConversationTurnSentByOutboundId(outboundMessageId:string):Promise<boolean>{
+  const [result]:any=await pool.execute("UPDATE conversation_turns SET status='sent',last_error_code=NULL,recovery_token=NULL,recovery_lease_until=NULL WHERE outbound_message_id=? AND status IN ('send_pending','sending','uncertain')",[outboundMessageId])
+  return result.affectedRows>0
 }
 
-export async function resumeConversationTurn(turnId:number,settingsVersion:number):Promise<void>{
-  await pool.execute("UPDATE conversation_turns SET status='processing',settings_version=?,last_error_code=NULL WHERE id=? AND status IN ('received','processing')",[settingsVersion,turnId])
+export async function markConversationTurnFailed(turnId: number, code: string,recoveryToken?:string): Promise<void> {
+  await pool.execute(`UPDATE conversation_turns SET status='failed',last_error_code=?,recovery_token=NULL,recovery_lease_until=NULL WHERE id=?${recoveryToken?' AND recovery_token=? AND recovery_lease_until>=UTC_TIMESTAMP(3)':' AND recovery_token IS NULL'}`,recoveryToken?[code.slice(0,80),turnId,recoveryToken]:[code.slice(0,80),turnId])
 }
 
-export async function listRecoverableConversationTurns():Promise<ConversationTurnRecord[]>{
-  const [rows]:any=await pool.query(`SELECT id,jid,wa_message_id AS waMessageId,status,settings_version AS settingsVersion,outcome_kind AS outcomeKind,
-    outbound_text AS outboundText,outbound_message_id AS outboundMessageId,send_attempts AS sendAttempts FROM conversation_turns
-    WHERE status IN ('received','processing','action_applied','send_pending','uncertain') ORDER BY id`)
-  return rows.map(conversationTurnRow)
+export async function beginConversationTurnSend(turnId:number,recoveryToken?:string):Promise<boolean>{
+  const sql=recoveryToken
+    ?"UPDATE conversation_turns SET status='sending',updated_at=UTC_TIMESTAMP(3) WHERE id=? AND status='send_pending' AND recovery_token=? AND recovery_lease_until>=UTC_TIMESTAMP(3)"
+    :"UPDATE conversation_turns SET status='sending',updated_at=UTC_TIMESTAMP(3) WHERE id=? AND status='send_pending' AND recovery_token IS NULL"
+  const [result]:any=await pool.execute(sql,recoveryToken?[turnId,recoveryToken]:[turnId])
+  return result.affectedRows===1
+}
+
+export async function deferConversationTurnSend(turnId:number,recoveryToken?:string):Promise<void>{
+  await pool.execute(`UPDATE conversation_turns SET status='send_pending',recovery_token=NULL,recovery_lease_until=NULL WHERE id=? AND status='sending'${recoveryToken?' AND recovery_token=?':' AND recovery_token IS NULL'}`,recoveryToken?[turnId,recoveryToken]:[turnId])
+}
+
+export async function releaseRecoveryClaim(turnId:number,recoveryToken:string):Promise<void>{
+  await pool.execute('UPDATE conversation_turns SET recovery_token=NULL,recovery_lease_until=NULL WHERE id=? AND recovery_token=?',[turnId,recoveryToken])
+}
+
+export async function markStaleSendingUncertain():Promise<number>{
+  const [result]:any=await pool.execute("UPDATE conversation_turns SET status='uncertain',last_error_code='send_interrupted',recovery_token=NULL,recovery_lease_until=NULL WHERE status='sending' AND updated_at<DATE_SUB(UTC_TIMESTAMP(3),INTERVAL 2 MINUTE)")
+  return Number(result.affectedRows)
+}
+
+export async function resumeConversationTurn(turnId:number,settingsVersion:number,recoveryToken?:string):Promise<boolean>{
+  const [result]:any=await pool.execute(`UPDATE conversation_turns SET status='processing',settings_version=?,last_error_code=NULL WHERE id=? AND status IN ('received','processing')${recoveryToken?' AND recovery_token=? AND recovery_lease_until>=UTC_TIMESTAMP(3)':' AND recovery_token IS NULL'}`,recoveryToken?[settingsVersion,turnId,recoveryToken]:[settingsVersion,turnId])
+  return result.affectedRows===1
+}
+
+export async function getRecoveryHighWaterMark():Promise<number>{
+  const [[row]]:any=await pool.query('SELECT COALESCE(MAX(id),0) AS throughId FROM conversation_turns')
+  return Number(row.throughId)
+}
+
+export async function claimRecoverableConversationTurnsPage(afterId:number,throughId:number,limit:number,recoveryToken:string,leaseSeconds=120,minimumAgeSeconds=300):Promise<{items:ConversationTurnRecord[];nextCursor:number;done:boolean}>{
+  const bounded=Math.max(1,Math.min(500,Math.floor(limit)))
+  const lease=Math.max(30,Math.min(600,Math.floor(leaseSeconds)))
+  const minimumAge=Math.max(0,Math.min(3600,Math.floor(minimumAgeSeconds)))
+  const conn=await pool.getConnection()
+  try{
+    await conn.beginTransaction()
+    const [scanned]:any=await conn.execute(`SELECT id,status FROM conversation_turns WHERE id>? AND id<=? AND updated_at<=DATE_SUB(UTC_TIMESTAMP(3),INTERVAL ? SECOND) ORDER BY id LIMIT ? FOR UPDATE SKIP LOCKED`,[afterId,throughId,minimumAge,bounded])
+    if(!scanned.length){await conn.commit();return {items:[],nextCursor:throughId,done:true}}
+    const nextCursor=Number(scanned.at(-1).id)
+    const eligibleIds=scanned.filter((row:any)=>['received','processing','action_applied','send_pending'].includes(row.status)).map((row:any)=>Number(row.id))
+    if(eligibleIds.length){await conn.query(`UPDATE conversation_turns SET recovery_token=?,recovery_lease_until=DATE_ADD(UTC_TIMESTAMP(3),INTERVAL ? SECOND)
+      WHERE id IN (${eligibleIds.map(()=>'?').join(',')}) AND status IN ('received','processing','action_applied','send_pending')
+      AND (recovery_token IS NULL OR recovery_lease_until<UTC_TIMESTAMP(3))`,[recoveryToken,lease,...eligibleIds])}
+    const [rows]:any=eligibleIds.length?await conn.query(`SELECT id,jid,wa_message_id AS waMessageId,status,settings_version AS settingsVersion,outcome_kind AS outcomeKind,
+      outbound_text AS outboundText,outbound_message_id AS outboundMessageId,send_attempts AS sendAttempts FROM conversation_turns
+      WHERE recovery_token=? AND id IN (${eligibleIds.map(()=>'?').join(',')}) ORDER BY id`,[recoveryToken,...eligibleIds]):[[]]
+    await conn.commit()
+    return {items:rows.map(conversationTurnRow),nextCursor,done:nextCursor>=throughId}
+  }catch(error){await conn.rollback();throw error}finally{conn.release()}
 }
 
 export async function getPendingIntent(jid: string): Promise<PendingIntentRecord | null> {
@@ -520,6 +592,10 @@ export async function savePendingIntent(jid: string, record: PendingIntentRecord
 }
 
 export async function clearPendingIntent(jid: string): Promise<void> { await pool.execute('DELETE FROM pending_intents WHERE jid=?',[jid]) }
+
+export async function clearPendingIntentBySource(jid:string,sourceMessageId:string):Promise<void>{
+  await pool.execute('DELETE FROM pending_intents WHERE jid=? AND source_message_id=?',[jid,sourceMessageId])
+}
 
 export async function getConversationEffect(turnId:number):Promise<{effectKey:string;effectType:string;result:any}|null>{
   const [rows]:any=await pool.execute('SELECT effect_key AS effectKey,effect_type AS effectType,result_json AS resultJson FROM conversation_effects WHERE effect_key LIKE ? ORDER BY created_at LIMIT 1',[`turn:${turnId}:%`])
@@ -576,12 +652,70 @@ export async function deleteContactData(contactId: number): Promise<boolean> {
   }catch(error){await conn.rollback();throw error}finally{conn.release()}
 }
 
-export async function deleteMessagesOlderThan(days: number): Promise<number> {
-  const [result]: any = await pool.execute('DELETE FROM messages WHERE created_at < DATE_SUB(UTC_TIMESTAMP(3), INTERVAL ? DAY)', [days])
-  await pool.execute('DELETE FROM pending_intents WHERE expires_at<UTC_TIMESTAMP(3)')
-  await pool.execute('DELETE FROM conversation_effects WHERE created_at < DATE_SUB(UTC_TIMESTAMP(3), INTERVAL ? DAY)',[days])
-  await pool.execute('DELETE FROM conversation_turns WHERE created_at < DATE_SUB(UTC_TIMESTAMP(3), INTERVAL ? DAY)',[days])
-  return result.affectedRows
+export const TERMINAL_TURN_RETENTION_DAYS=90
+
+export async function deleteMessagesOlderThan(days: number,batchSize=500,maxBatches=20): Promise<number> {
+  if(!Number.isInteger(days)||days<1||days>3650)throw new Error('message_retention_days_invalid')
+  const boundedBatch=Math.max(1,Math.min(1000,Math.floor(batchSize))),boundedBatches=Math.max(1,Math.min(100,Math.floor(maxBatches)))
+  let total=0
+  for(let batch=0;batch<boundedBatches;batch++){
+    const conn=await pool.getConnection()
+    try{
+      await conn.beginTransaction()
+      const [rows]:any=await conn.execute('SELECT id FROM messages WHERE message_timestamp<DATE_SUB(UTC_TIMESTAMP(3),INTERVAL ? DAY) ORDER BY id LIMIT ? FOR UPDATE',[days,boundedBatch])
+      if(!rows.length){await conn.commit();break}
+      const ids=rows.map((row:any)=>Number(row.id))
+      const [result]:any=await conn.query(`DELETE FROM messages WHERE id IN (${ids.map(()=>'?').join(',')})`,ids)
+      total+=Number(result.affectedRows);await conn.commit()
+      if(rows.length<boundedBatch)break
+    }catch(error){await conn.rollback();throw error}finally{conn.release()}
+  }
+  return total
+}
+
+export async function cleanupOperationalRecords(retentionDays=TERMINAL_TURN_RETENTION_DAYS,batchSize=500,maxBatches=20):Promise<{turns:number;effects:number;pendingIntents:number}>{
+  if(!Number.isInteger(retentionDays)||retentionDays<1||retentionDays>3650)throw new Error('operational_retention_days_invalid')
+  const boundedBatch=Math.max(1,Math.min(1000,Math.floor(batchSize)))
+  const boundedBatches=Math.max(1,Math.min(100,Math.floor(maxBatches)))
+  let turns=0,effects=0,pendingIntents=0
+  for(let batch=0;batch<boundedBatches;batch++){
+    const conn=await pool.getConnection()
+    try{
+      await conn.beginTransaction()
+      if(batch===0){const [expired]:any=await conn.execute('DELETE FROM pending_intents WHERE expires_at<UTC_TIMESTAMP(3)');pendingIntents=Number(expired.affectedRows)}
+      const [rows]:any=await conn.execute(`SELECT id FROM conversation_turns
+        WHERE status IN ('sent','failed') AND updated_at<DATE_SUB(UTC_TIMESTAMP(3),INTERVAL ? DAY)
+        ORDER BY id LIMIT ? FOR UPDATE`,[retentionDays,boundedBatch])
+      if(!rows.length){await conn.commit();break}
+      for(const row of rows){const [removed]:any=await conn.execute('DELETE FROM conversation_effects WHERE effect_key LIKE ?',[`turn:${row.id}:%`]);effects+=Number(removed.affectedRows)}
+      const ids=rows.map((row:any)=>Number(row.id))
+      const [removedTurns]:any=await conn.query(`DELETE FROM conversation_turns WHERE id IN (${ids.map(()=>'?').join(',')})`,ids)
+      turns+=Number(removedTurns.affectedRows)
+      await conn.commit()
+      if(rows.length<boundedBatch)break
+    }catch(error){await conn.rollback();throw error}finally{conn.release()}
+  }
+  return {turns,effects,pendingIntents}
+}
+
+export async function clearAllConversationHistory():Promise<{messages:number;chats:number;turns:number;effects:number;pendingIntents:number}>{
+  const conn=await pool.getConnection()
+  try{
+    await conn.beginTransaction()
+    const [[counts]]:any=await conn.query(`SELECT
+      (SELECT COUNT(*) FROM messages) AS messages,
+      (SELECT COUNT(*) FROM chats) AS chats,
+      (SELECT COUNT(*) FROM conversation_turns) AS turns,
+      (SELECT COUNT(*) FROM conversation_effects) AS effects,
+      (SELECT COUNT(*) FROM pending_intents) AS pendingIntents`)
+    await conn.query('DELETE FROM conversation_effects')
+    await conn.query('DELETE FROM pending_intents')
+    await conn.query('DELETE FROM conversation_turns')
+    await conn.query('DELETE FROM messages')
+    await conn.query('DELETE FROM chats')
+    await conn.commit()
+    return {messages:Number(counts.messages),chats:Number(counts.chats),turns:Number(counts.turns),effects:Number(counts.effects),pendingIntents:Number(counts.pendingIntents)}
+  }catch(error){await conn.rollback();throw error}finally{conn.release()}
 }
 
 export async function listAppointments(): Promise<AppointmentListRow[]> {

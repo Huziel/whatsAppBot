@@ -1,6 +1,7 @@
 import { createManualContact, exportContactData, listContactMessages, listContacts, listInboxChats, setChatBotPaused, updateContactProfile } from '../../db'
 import { UiCallbacks } from '../../ui/settings'
 import { validateContactProfile } from '../../ui/validators'
+import type { ManualMessage } from '../../ui/settings'
 import { ApiContext, readJson, sendJson } from '../shared'
 
 export async function handleContactsRoute({ request, response, url }: ApiContext, callbacks: UiCallbacks): Promise<boolean> {
@@ -33,9 +34,21 @@ export async function handleContactsRoute({ request, response, url }: ApiContext
     sendJson(response,updated?200:404,updated?{botPaused:body.paused}:{error:'Contacto no encontrado'});return true
   }
   if(request.method==='POST'&&action==='messages'){
-    const body=await readJson(request)
-    if(typeof body.text!=='string'||!body.text.trim()||body.text.length>4000)throw new Error('El mensaje manual debe tener entre 1 y 4000 caracteres')
-    await callbacks.sendManualMessage(contactId,body.text.trim())
+    const body=await readJson(request,7_100_000)
+    const text=typeof body.text==='string'?body.text.trim():''
+    if(text.length>4000)throw new Error('El texto o pie de imagen admite hasta 4000 caracteres')
+    let image:Buffer|null=null,mimeType:string|null=null
+    if(body.imageData!==undefined&&body.imageData!==null&&body.imageData!==''){
+      if(typeof body.imageData!=='string'||typeof body.imageMimeType!=='string')throw new Error('La imagen no tiene un formato válido')
+      if(!['image/jpeg','image/png','image/webp'].includes(body.imageMimeType))throw new Error('La imagen debe ser JPG, PNG o WebP')
+      if(body.imageData.length>7_000_000||!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(body.imageData))throw new Error('El archivo de imagen no es válido o supera 5 MB')
+      image=Buffer.from(body.imageData,'base64')
+      if(!image.length||image.length>5*1024*1024||image.toString('base64')!==body.imageData)throw new Error('La imagen debe pesar como máximo 5 MB')
+      mimeType=body.imageMimeType
+    }
+    if(!text&&!image)throw new Error('Escribe un mensaje o selecciona una imagen')
+    const message:ManualMessage={text,image,mimeType}
+    await callbacks.sendManualMessage(contactId,message)
     sendJson(response,200,{message:'Mensaje enviado'});return true
   }
   if(request.method==='GET'&&action==='export'){

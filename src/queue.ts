@@ -12,6 +12,7 @@ export class PersistentQueue {
   private fileOperations: Promise<void> = Promise.resolve()
   private retryTimer: NodeJS.Timeout | undefined
   private suppressedJids = new Set<string>()
+  private suppressConversationOperations=false
   constructor(file = './data/pending-operations.jsonl') { this.file = path.resolve(file) }
 
   async initialize(): Promise<void> {
@@ -22,9 +23,11 @@ export class PersistentQueue {
     } catch (error: any) { if (error.code !== 'ENOENT') throw error }
   }
   async enqueue(kind: Operation['kind'], data: any): Promise<void> {
+    if(this.suppressConversationOperations&&this.isConversationOperation(kind))return
     if(typeof data?.jid==='string'&&this.suppressedJids.has(data.jid))return
     const op = { id: `${Date.now()}-${Math.random().toString(36).slice(2)}`, kind, data }
     await this.withFileLock(() => fs.appendFile(this.file, `${JSON.stringify(op, BufferJSON.replacer)}\n`, 'utf8'))
+    if(this.suppressConversationOperations&&this.isConversationOperation(kind))return
     this.pending.push(op)
     void this.drain()
   }
@@ -67,6 +70,14 @@ export class PersistentQueue {
     this.pending=this.pending.filter(operation=>!blocked.has(operation.data?.jid))
     await this.withFileLock(()=>this.rewrite())
   }
+  async discardConversationHistory():Promise<void>{
+    this.suppressConversationOperations=true
+    await this.fileOperations
+    while(this.running)await new Promise(resolve=>setTimeout(resolve,25))
+    this.pending=this.pending.filter(operation=>!this.isConversationOperation(operation.kind))
+    await this.withFileLock(()=>this.rewrite())
+  }
+  resumeConversationWrites():void{this.suppressConversationOperations=false}
   releaseJids(jids:string[]):void{for(const jid of jids)this.suppressedJids.delete(jid)}
   count(): number { return this.pending.length }
   private async rewrite(): Promise<void> {
@@ -74,6 +85,7 @@ export class PersistentQueue {
     await fs.writeFile(temp, this.pending.map(op => JSON.stringify(op, BufferJSON.replacer)).join('\n') + (this.pending.length ? '\n' : ''), 'utf8')
     await fs.rename(temp, this.file)
   }
+  private isConversationOperation(kind:Operation['kind']):boolean{return ['message','delete','status','chat'].includes(kind)}
   private withFileLock<T>(operation: () => Promise<T>): Promise<T> {
     const result = this.fileOperations.then(operation)
     this.fileOperations = result.then(() => undefined, () => undefined)

@@ -38,6 +38,8 @@ export class RecentConversationMemory {
 
   clear(jid: string): void { this.chats.delete(jid) }
 
+  clearAll():void{this.chats.clear()}
+
   pruneOlderThan(timestampMs: number): void {
     for (const [jid, entries] of this.chats) {
       const recent = entries.filter(entry => entry.timestampMs >= timestampMs)

@@ -2,8 +2,10 @@ import { createServer, IncomingMessage, ServerResponse } from 'node:http'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import { AppSettings, UiCallbacks } from '../ui/settings'
+import { config } from '../config'
 import { handleApiRequest } from './api'
-import { sendJson } from './shared'
+import { readJson, sendJson } from './shared'
+import { DashboardAuth } from './auth'
 
 const mimeTypes: Record<string,string> = {
   '.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.mjs':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8',
@@ -45,12 +47,48 @@ async function serveStatic(response: ServerResponse, pathname: string, root: str
 export async function launchDashboardServer(fallback: AppSettings, callbacks: UiCallbacks, port = 3000): Promise<ReturnType<typeof createServer>> {
   const compiled = __dirname.split(path.sep).includes('dist')
   const staticRoot = compiled ? path.resolve(__dirname,'../../public') : path.resolve(process.cwd(),'web')
+  const auth=new DashboardAuth(path.join(config.dataDir,'dashboard-auth.json'))
+  await auth.initialize()
   const server = createServer(async (request,response) => {
     if (!isLoopback(request.socket.remoteAddress)) { sendJson(response,403,{error:'Acceso solo desde localhost'});return }
     if(!isTrustedDashboardRequest(request,port)){sendJson(response,403,{error:'Solicitud de otro origen rechazada'});return}
     const url = new URL(request.url??'/',`http://${request.headers.host??'127.0.0.1'}`)
-    if (url.pathname.startsWith('/api/')) { await handleApiRequest({request,response,url},fallback,callbacks);return }
-    if (request.method==='GET'||request.method==='HEAD') { await serveStatic(response,url.pathname,staticRoot,request.method==='HEAD');return }
+    if(url.pathname.startsWith('/api/auth/')){
+      try{
+        if(url.pathname==='/api/auth/status'&&request.method==='GET'){sendJson(response,200,auth.status(request));return}
+        if(url.pathname==='/api/auth/setup'&&request.method==='POST'){
+          const body=await readJson(request)
+          await auth.setup(body.username,body.password,response)
+          sendJson(response,200,{configured:true,authenticated:true});return
+        }
+        if(url.pathname==='/api/auth/login'&&request.method==='POST'){
+          const body=await readJson(request)
+          await auth.login(body.username,body.password,request,response)
+          sendJson(response,200,{authenticated:true});return
+        }
+        if(url.pathname==='/api/auth/logout'&&request.method==='POST'){
+          await auth.logout(request,response);sendJson(response,200,{authenticated:false});return
+        }
+        sendJson(response,404,{error:'Ruta de acceso no encontrada'});return
+      }catch(error:any){sendJson(response,400,{error:error.message||'No se pudo validar el acceso'});return}
+    }
+    const loggedIn=auth.authenticated(request)
+    if(url.pathname.startsWith('/api/')){
+      if(!loggedIn){sendJson(response,401,{error:'Inicia sesión para continuar.'});return}
+      await handleApiRequest({request,response,url},fallback,callbacks);return
+    }
+    if(request.method==='GET'||request.method==='HEAD'){
+      if(!loggedIn){
+        const publicLoginAsset=url.pathname==='/assets/dashboard.css'||url.pathname==='/js/login.js'
+        if(publicLoginAsset){await serveStatic(response,url.pathname,staticRoot,request.method==='HEAD');return}
+        if(url.pathname==='/login'||url.pathname==='/login.html'||url.pathname==='/'){
+          await serveStatic(response,'/login.html',staticRoot,request.method==='HEAD');return
+        }
+        response.writeHead(302,{location:'/','cache-control':'no-store'});response.end();return
+      }
+      if(url.pathname==='/login'||url.pathname==='/login.html'){response.writeHead(302,{location:'/','cache-control':'no-store'});response.end();return}
+      await serveStatic(response,url.pathname,staticRoot,request.method==='HEAD');return
+    }
     sendJson(response,405,{error:'Método no permitido'})
   })
   await new Promise<void>((resolve,reject)=>{server.once('error',reject);server.listen(port,'127.0.0.1',resolve)})

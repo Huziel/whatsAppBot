@@ -21,10 +21,13 @@ export interface UiCallbacks {
   start: (settings: AppSettings) => Promise<void>
   applySettings?: (settings: AppSettings) => Promise<void>
   logout: () => Promise<void>
-  sendManualMessage: (contactId: number, text: string) => Promise<void>
+  sendManualMessage: (contactId: number, message: ManualMessage) => Promise<void>
   deleteContact: (contactId: number) => Promise<boolean>
+  clearConversations: () => Promise<{messages:number;chats:number;turns:number}>
   status: () => { serviceStatus: string; disconnectCode: number | null; pendingWrites: number }
 }
+
+export interface ManualMessage { text:string; image:Buffer|null; mimeType:string|null }
 
 const settingsPath = path.join(config.dataDir, 'app-settings.json')
 let settingsWrite: Promise<void> = Promise.resolve()

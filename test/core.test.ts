@@ -5,7 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { DateTime } from 'luxon'
 import { isIndividualJid, messageDedupKey, resolveIdentity } from '../src/identity'
-import { isNonContentProtocolType, normalizeMessage, shouldAutoReply, timestampDate } from '../src/message'
+import { isMessageAtOrAfterStart, isNonContentProtocolType, normalizeMessage, shouldAutoReply, timestampDate } from '../src/message'
 import { PersistentQueue } from '../src/queue'
 import { validateContactProfile, validateInventoryItem, validateSettings } from '../src/config-ui'
 import { detectCatalogRequest, detectPaymentRequest, generateDeepSeekResponse } from '../src/deepseek'
@@ -54,10 +54,17 @@ test('convierte timestamps Unix en milisegundos', () => {
   assert.equal(timestampDate({ toNumber: () => 1_700_000_001 }).toISOString(), '2023-11-14T22:13:21.000Z')
 })
 
-test('auto respuesta solo acepta notify entrante individual posterior al inicio', () => {
+test('solo considera archivable un mensaje cuya marca temporal alcanza el inicio del servicio',()=>{
+  assert.equal(isMessageAtOrAfterStart(1_700_000_000,1_700_000_001),false)
+  assert.equal(isMessageAtOrAfterStart(1_700_000_001,1_700_000_001),true)
+})
+
+test('auto respuesta acepta eventos entrantes nuevos notify y append', () => {
   const incoming = { key: { id: 'm1', remoteJid: '5215550000000@s.whatsapp.net', fromMe: false }, messageTimestamp: 1_700_000_001, message: { conversation: 'hola' } }
   assert.equal(shouldAutoReply(incoming, 'notify', 1_700_000_000), true)
-  assert.equal(shouldAutoReply(incoming, 'append', 1_700_000_000), false)
+  assert.equal(shouldAutoReply(incoming, 'append', 1_700_000_000), true)
+  assert.equal(shouldAutoReply(incoming, 'history', 1_700_000_000), false)
+  assert.equal(shouldAutoReply(incoming, 'append', 1_700_000_002), false)
   assert.equal(shouldAutoReply(incoming, 'notify', 1_700_000_002), false)
   assert.equal(shouldAutoReply({ ...incoming, key: { ...incoming.key, fromMe: true } }, 'notify', 1_700_000_000), false)
   assert.equal(shouldAutoReply({ ...incoming, key: { ...incoming.key, remoteJid: '123@g.us' } }, 'notify', 1_700_000_000), false)
@@ -149,6 +156,9 @@ test('detecta solicitudes explícitas de catálogo completo en español', () => 
   assert.equal(detectCatalogRequest('¿Qué productos tienes?'), 'products')
   assert.equal(detectCatalogRequest('Muéstrame tus productos'), 'products')
   assert.equal(detectCatalogRequest('Quiero el catálogo completo de servicios'), 'services')
+  assert.equal(detectCatalogRequest('¿Tienes servicios?'), 'services')
+  assert.equal(detectCatalogRequest('¿Qué servicios ofrecen?'), 'services')
+  assert.equal(detectCatalogRequest('¿Venden productos?'), 'products')
   assert.equal(detectCatalogRequest('Muéstrame productos y servicios'), 'both')
   assert.equal(detectCatalogRequest('¿Cuánto cuesta el termo?'), null)
 })
@@ -247,12 +257,20 @@ test('estado compartido del dashboard conserva ajustes de otras secciones', () =
 
 test('dashboard conserva destinos de navegación y campos opcionales accesibles', async () => {
   const html = await fs.readFile(path.resolve('web/index.html'), 'utf8')
+  const conversations = await fs.readFile(path.resolve('web/js/views/conversations.js'), 'utf8')
   const routes = [...html.matchAll(/data-route="([^"]+)"/g)].map(match => match[1])
   assert.ok(routes.includes('dashboard') && routes.includes('conversations') && routes.includes('privacy'))
   for (const route of new Set(routes)) assert.match(html, new RegExp(`id="view-${route}"`))
   assert.match(html, /id="view-ai" data-view="ai" class="page-view hidden/)
   assert.match(html, /id="view-privacy" data-view="privacy" class="page-view hidden/)
   assert.match(html, /id="clearDeepseekApiKey" type="checkbox"/)
+  assert.match(html, /id="serviceForm"/)
+  assert.match(html, /id="serviceImageUrl"[^>]*type="url"/)
+  assert.match(html, /id="serviceImagePreview"/)
+  assert.match(html,/id="clearConversations"/)
+  assert.match(conversations,/toggleChatPause\(chat\)/)
+  assert.match(conversations,/Reanudar IA/)
+  assert.match(conversations,/Pausar IA/)
   assert.match(html, /aria-label="Abrir navegación"/)
 })
 
@@ -295,4 +313,19 @@ test('la cola recupera operaciones pendientes persistidas tras reiniciar', async
   assert.equal(queue.count(), 1)
   await queue.close()
   await fs.rm(dir, { recursive: true, force: true })
+})
+
+test('vaciar conversaciones descarta escrituras pendientes de mensajes y chats pero conserva contactos',async()=>{
+  const dir=await fs.mkdtemp(path.join(os.tmpdir(),'wa-queue-clear-')),file=path.join(dir,'pending.jsonl')
+  const operations=[
+    {id:'message',kind:'message',data:{jid:'chat@s.whatsapp.net'}},
+    {id:'chat',kind:'chat',data:{jid:'chat@s.whatsapp.net'}},
+    {id:'status',kind:'status',data:{jid:'chat@s.whatsapp.net'}},
+    {id:'contact',kind:'contact',data:{jid:'chat@s.whatsapp.net'}},
+  ]
+  await fs.writeFile(file,operations.map(item=>JSON.stringify(item)).join('\n')+'\n')
+  const queue=new PersistentQueue(file);await queue.initialize();await queue.discardConversationHistory()
+  assert.equal(queue.count(),1)
+  assert.equal(JSON.parse(await fs.readFile(file,'utf8')).kind,'contact')
+  queue.resumeConversationWrites();await queue.close();await fs.rm(dir,{recursive:true,force:true})
 })
