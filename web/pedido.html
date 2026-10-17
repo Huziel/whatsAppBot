@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#07110b">
+  <meta name="robots" content="noindex,nofollow">
+  <title>Estado del pedido</title>
+  <link rel="stylesheet" href="/assets/dashboard.css">
+</head>
+<body class="menu-page min-h-screen">
+  <header class="menu-header"><a href="/menu" class="menu-brand"><span class="menu-mark">M</span><span><strong>Estado del pedido</strong><small>Consulta segura</small></span></a></header>
+  <main class="menu-layout order-status-layout">
+    <section class="menu-main">
+      <div class="menu-hero"><p class="eyebrow">SEGUIMIENTO</p><h1 id="orderFolio">Consultando pedido…</h1><p id="orderStatusText">Validando el acceso seguro.</p></div>
+      <div id="orderStatusNotice" class="menu-notice" role="alert"></div>
+      <section id="orderDetail" class="menu-cart-card hidden" aria-live="polite">
+        <div class="menu-cart-heading"><div><p class="eyebrow">PEDIDO</p><h2 id="orderStatus"></h2></div></div>
+        <div id="orderItems" class="menu-cart-items"></div>
+        <div class="menu-total-row"><span>Total</span><strong id="orderTotal"></strong></div>
+        <p id="orderPayment" class="menu-quote-note"></p>
+        <p id="orderExpiry" class="menu-checkout-footnote"></p>
+      </section>
+    </section>
+  </main>
+  <footer class="menu-footer"><a href="/menu">Volver al menú</a></footer>
+  <script type="module" src="/js/public-order.js?v=1"></script>
+</body>
+</html>

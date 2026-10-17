@@ -1,4 +1,5 @@
 import { $, api } from '../api.js'
+import { confirmAction, showToast } from '../ui/dialogs.js?v=dialogs-1'
 import { getSettings } from '../state.mjs'
 
 let chats=[],selected=null,page=1,total=0,searchTimer
@@ -123,4 +124,4 @@ async function sendManual(event){
   }catch(error){$('manualSendNotice').textContent=error.message}
   finally{button.disabled=false}
 }
-async function deleteSelected(){if(!selected||!confirm('¿Eliminar permanentemente el contacto y sus chats, mensajes, citas, carritos y pedidos?'))return;try{await api('/api/contacts/'+selected.contactId,'DELETE');selected=null;$('chatPanel').classList.add('hidden');await loadInbox()}catch(error){$('inboxNotice').textContent=error.message}}
+async function deleteSelected(){if(!selected||!await confirmAction({title:'Eliminar contacto',message:'Se eliminarán permanentemente el contacto y sus chats, mensajes, citas, carritos y pedidos.',confirmText:'Eliminar',danger:true}))return;try{await api('/api/contacts/'+selected.contactId,'DELETE');selected=null;$('chatPanel').classList.add('hidden');showToast('Contacto eliminado.');await loadInbox()}catch(error){$('inboxNotice').textContent=error.message;showToast(error.message,'error')}}

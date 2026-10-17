@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#07110b">
+  <meta name="robots" content="noindex,nofollow">
+  <title>Menú — WhatsApp Bot</title>
+  <link rel="stylesheet" href="/assets/dashboard.css">
+</head>
+<body class="menu-page min-h-screen">
+  <header class="menu-header">
+    <a href="/menu" class="menu-brand" aria-label="Inicio del menú"><span class="menu-mark">M</span><span><strong id="menuBusinessName">Menú del negocio</strong><small>Catálogo y pedidos</small></span></a>
+  </header>
+  <main class="menu-layout">
+    <section class="menu-main">
+      <div class="menu-hero"><p class="eyebrow">CATÁLOGO</p><h1>Elige lo que necesitas</h1><p>Agrega productos o servicios al carrito y envía tu pedido para confirmación.</p></div>
+      <div class="menu-toolbar"><div class="menu-categories" role="group" aria-label="Filtrar catálogo"><button class="menu-filter active" type="button" data-category="all">Todo</button><button class="menu-filter" type="button" data-category="product">Productos</button><button class="menu-filter" type="button" data-category="service">Servicios</button></div><label class="menu-search"><span aria-hidden="true">⌕</span><input id="menuSearch" type="search" placeholder="Buscar en el menú" aria-label="Buscar productos y servicios"></label></div>
+      <div id="menuNotice" class="menu-notice" role="status">Cargando menú…</div>
+      <div id="menuItems" class="menu-grid"></div>
+    </section>
+    <aside class="menu-cart-card" aria-label="Tu pedido">
+      <div class="menu-cart-heading"><div><p class="eyebrow">TU PEDIDO</p><h2>Carrito <span id="cartCount" class="menu-count">0</span></h2></div><span class="menu-bag" aria-hidden="true">▢</span></div>
+      <div id="cartEmpty" class="menu-cart-empty">Tu carrito está vacío.<br>Agrega productos o servicios para comenzar.</div>
+      <div id="cartItems" class="menu-cart-items"></div>
+      <div id="cartTotalRow" class="menu-total-row hidden"><span>Total estimado</span><strong id="cartTotal"></strong></div>
+      <p id="quoteNote" class="menu-quote-note hidden">El total se confirmará al revisar los artículos a cotizar.</p>
+      <form id="checkoutForm" class="menu-checkout-form">
+        <div><label for="customerName">Tu nombre <span>(opcional)</span></label><input id="customerName" name="customerName" maxlength="160" autocomplete="name" placeholder="¿Cómo te llamas?"></div>
+        <div><label for="phoneNumber">WhatsApp <span>requerido</span></label><input id="phoneNumber" name="phoneNumber" type="tel" inputmode="tel" autocomplete="tel" maxlength="32" placeholder="+52 55 1234 5678" required><small>Incluye el prefijo internacional para poder registrar tu pedido.</small></div>
+        <div class="menu-honeypot" aria-hidden="true"><label for="website">Sitio web</label><input id="website" name="website" tabindex="-1" autocomplete="off"></div>
+        <button id="submitOrder" class="menu-submit" type="submit" disabled>Enviar pedido</button>
+        <div id="checkoutNotice" class="menu-checkout-notice hidden" role="alert"></div>
+        <p class="menu-checkout-footnote">El pedido queda pendiente de confirmación. No se realiza ningún cobro desde esta página.</p>
+      </form>
+      <div id="orderConfirmation" class="menu-confirmation hidden" role="status"></div>
+    </aside>
+  </main>
+  <footer class="menu-footer">Pedido seguro · El negocio confirmará disponibilidad y total por WhatsApp.</footer>
+  <script type="module" src="/js/public-menu.js?v=1"></script>
+</body>
+</html>

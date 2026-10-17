@@ -1,12 +1,13 @@
 import { $, api, setNotice } from '../api.js'
 import { setSettings, updateSettingsDraft } from '../state.mjs'
+import { promptAction, showToast } from '../ui/dialogs.js?v=dialogs-1'
 
 const values = () => ({
   botName:$('botName').value,businessName:$('businessName').value,autoReply:$('autoReply').checked,
   responseMode:$('responseMode').value,responseText:$('responseText').value,replyDelayMs:Number($('delay').value),
   saveToDatabase:$('saveToDatabase').checked,deepseekModel:$('deepseekModel').value,aiTone:$('aiTone').value,
   aiResponseLength:$('aiResponseLength').value,aiSystemInstructions:$('aiSystemInstructions').value,
-  maxRepliesPerHour:Number($('maxRepliesPerHour').value),messageRetentionDays:Number($('messageRetentionDays').value),
+  maxRepliesPerHour:Number($('maxRepliesPerHour').value),messageRetentionDays:Number($('messageRetentionDays').value),orderReservationMinutes:Number($('orderReservationMinutes').value),
   productCatalogImageUrl:$('productCatalogImageUrl').value||null,serviceCatalogImageUrl:$('serviceCatalogImageUrl').value||null,
   transferEnabled:$('transferEnabled').checked,transferBankName:$('transferBankName').value,
   transferAccountHolder:$('transferAccountHolder').value,transferAccountNumber:$('transferAccountNumber').value,
@@ -19,7 +20,7 @@ const values = () => ({
 })
 
 function fill(settings){
-  const mapping={botName:'botName',businessName:'businessName',autoReply:'autoReply',responseMode:'responseMode',responseText:'responseText',replyDelayMs:'delay',saveToDatabase:'saveToDatabase',deepseekModel:'deepseekModel',aiTone:'aiTone',aiResponseLength:'aiResponseLength',aiSystemInstructions:'aiSystemInstructions',maxRepliesPerHour:'maxRepliesPerHour',messageRetentionDays:'messageRetentionDays',productCatalogImageUrl:'productCatalogImageUrl',serviceCatalogImageUrl:'serviceCatalogImageUrl',transferEnabled:'transferEnabled',transferBankName:'transferBankName',transferAccountHolder:'transferAccountHolder',transferAccountNumber:'transferAccountNumber',transferClabe:'transferClabe',transferInstructions:'transferInstructions',appointmentsEnabled:'appointmentsEnabled',appointmentTimeZone:'appointmentTimeZone',appointmentStartTime:'appointmentStartTime',appointmentEndTime:'appointmentEndTime',appointmentDurationMinutes:'appointmentDurationMinutes'}
+  const mapping={botName:'botName',businessName:'businessName',autoReply:'autoReply',responseMode:'responseMode',responseText:'responseText',replyDelayMs:'delay',saveToDatabase:'saveToDatabase',deepseekModel:'deepseekModel',aiTone:'aiTone',aiResponseLength:'aiResponseLength',aiSystemInstructions:'aiSystemInstructions',maxRepliesPerHour:'maxRepliesPerHour',messageRetentionDays:'messageRetentionDays',orderReservationMinutes:'orderReservationMinutes',productCatalogImageUrl:'productCatalogImageUrl',serviceCatalogImageUrl:'serviceCatalogImageUrl',transferEnabled:'transferEnabled',transferBankName:'transferBankName',transferAccountHolder:'transferAccountHolder',transferAccountNumber:'transferAccountNumber',transferClabe:'transferClabe',transferInstructions:'transferInstructions',appointmentsEnabled:'appointmentsEnabled',appointmentTimeZone:'appointmentTimeZone',appointmentStartTime:'appointmentStartTime',appointmentEndTime:'appointmentEndTime',appointmentDurationMinutes:'appointmentDurationMinutes'}
   for(const [key,id] of Object.entries(mapping)){const el=$(id);if(el.type==='checkbox')el.checked=Boolean(settings[key]);else el.value=settings[key]??''}
   document.querySelectorAll('.appointmentDay').forEach(el=>el.checked=settings.appointmentDays.includes(Number(el.value)))
   $('deepseekApiKey').value=''
@@ -34,6 +35,7 @@ function updateCatalogPreviews(){for(const [inputId,imageId] of [['productCatalo
 function validate(){
   if(!$('botName').value.trim()||!$('businessName').value.trim())return'Completa nombre del bot y del negocio.'
   const delay=Number($('delay').value);if(!Number.isInteger(delay)||delay<1500||delay>60000)return'La pausa debe ser un entero entre 1500 y 60000 ms.'
+  const reservationMinutes=Number($('orderReservationMinutes').value);if(!Number.isInteger(reservationMinutes)||reservationMinutes<5||reservationMinutes>1440)return'La reserva de pedidos debe durar entre 5 y 1440 minutos.'
   if($('autoReply').checked&&$('responseMode').value==='fixed'&&!$('responseText').value.trim())return'Escribe el texto de respuesta fija.'
   if($('appointmentsEnabled').checked&&(!$('autoReply').checked||$('responseMode').value!=='deepseek'))return'Las citas requieren respuestas automáticas y DeepSeek.'
   if($('transferEnabled').checked&&(!$('transferBankName').value.trim()||!$('transferAccountHolder').value.trim()||(!$('transferClabe').value.trim()&&!$('transferAccountNumber').value.trim())))return'Completa banco, titular y CLABE o número de cuenta.'
@@ -42,7 +44,7 @@ function validate(){
 
 function showConfigError(message){
   const lower=message.toLowerCase()
-  const target=lower.includes('cita')||lower.includes('horario')||lower.includes('zona horaria')||lower.includes('día')?'appointments':lower.includes('transferencia')||lower.includes('clabe')||lower.includes('banco')||lower.includes('retención')?'privacy':lower.includes('deepseek')||lower.includes('modelo de ia')||lower.includes('tono de ia')||lower.includes('instrucciones adicionales')?'ai':lower.includes('imagen')||lower.includes('catálogo')?'catalog':'settings'
+  const target=lower.includes('reserva de pedidos')?'sales':lower.includes('cita')||lower.includes('horario')||lower.includes('zona horaria')||lower.includes('día')?'appointments':lower.includes('transferencia')||lower.includes('clabe')||lower.includes('banco')||lower.includes('retención')?'privacy':lower.includes('deepseek')||lower.includes('modelo de ia')||lower.includes('tono de ia')||lower.includes('instrucciones adicionales')?'ai':lower.includes('imagen')||lower.includes('catálogo')?'catalog':'settings'
   if(location.hash.slice(1)!==target)location.hash=target
   setNotice('globalNotice',message,'error')
 }
@@ -64,7 +66,7 @@ export function initializeSettings(){
   archiveNote.className='mt-1 text-xs text-muted'
   archiveNote.textContent='Solo se guardan mensajes nuevos recibidos desde que se inicia WhatsApp. No se importa el historial anterior. Se conservan datos operativos cifrados para evitar acciones duplicadas y recuperar envíos.'
   archiveLabel.parentElement.after(archiveNote)
-  for(const selector of ['#botName','#businessName','#autoReply','#responseMode','#responseText','#delay','#saveToDatabase','#deepseekModel','#aiTone','#aiResponseLength','#aiSystemInstructions','#maxRepliesPerHour','#messageRetentionDays','#productCatalogImageUrl','#serviceCatalogImageUrl','#transferEnabled','#transferBankName','#transferAccountHolder','#transferAccountNumber','#transferClabe','#transferInstructions','#appointmentsEnabled','#appointmentTimeZone','#appointmentStartTime','#appointmentEndTime','#appointmentDurationMinutes','#deepseekApiKey','#clearDeepseekApiKey']){
+  for(const selector of ['#botName','#businessName','#autoReply','#responseMode','#responseText','#delay','#saveToDatabase','#deepseekModel','#aiTone','#aiResponseLength','#aiSystemInstructions','#maxRepliesPerHour','#messageRetentionDays','#orderReservationMinutes','#productCatalogImageUrl','#serviceCatalogImageUrl','#transferEnabled','#transferBankName','#transferAccountHolder','#transferAccountNumber','#transferClabe','#transferInstructions','#appointmentsEnabled','#appointmentTimeZone','#appointmentStartTime','#appointmentEndTime','#appointmentDurationMinutes','#deepseekApiKey','#clearDeepseekApiKey']){
     const element=document.querySelector(selector);element.addEventListener('input',()=>setDirty(true));element.addEventListener('change',()=>setDirty(true))
   }
   document.querySelectorAll('.appointmentDay').forEach(element=>element.addEventListener('change',()=>setDirty(true)))
@@ -77,12 +79,14 @@ export function initializeSettings(){
 }
 
 async function clearConversationHistory(){
-  const confirmation=window.prompt('Esta acción elimina todos los mensajes y chats, turnos pendientes y datos de recuperación. Los contactos, ventas, citas, catálogo y configuración se conservan. Escribe VACIAR para continuar.')
-  if(confirmation!=='VACIAR')return
+  const confirmation=await promptAction({title:'Vaciar historial',message:'Se eliminarán todos los mensajes y chats, turnos pendientes y datos de recuperación. Los contactos, ventas, citas, catálogo y configuración se conservarán.',confirmText:'Vaciar historial',input:{label:'Escribe VACIAR para confirmar',placeholder:'VACIAR'}})
+  if(confirmation===null)return
+  if(confirmation!=='VACIAR'){showToast('La confirmación no coincide. No se modificó el historial.','error');return}
   const button=$('clearConversations');button.disabled=true;$('clearConversationsNotice').textContent='Vaciando historial…'
   try{
     const result=await api('/api/conversations/clear','POST',{confirm:'VACIAR'})
     $('clearConversationsNotice').textContent=`${result.message} Se eliminaron ${result.messages} mensajes y ${result.chats} chats. Los contactos se conservaron.`
-  }catch(error){$('clearConversationsNotice').textContent=error.message}
+    showToast(result.message)
+  }catch(error){$('clearConversationsNotice').textContent=error.message;showToast(error.message,'error')}
   finally{button.disabled=false}
 }

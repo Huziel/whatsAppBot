@@ -8,12 +8,13 @@ import pino from 'pino'
 import qrcode from 'qrcode-terminal'
 import { DateTime } from 'luxon'
 import { config } from './config'
-import { applyShoppingCartActionVerified, assertConversationEngineSchema, beginConversationTurnSend, cancelAppointmentById, claimConversationTurn, claimRecoverableConversationTurnsPage, cleanupOperationalRecords, clearAllConversationHistory as clearConversationHistoryData, clearPendingIntent, clearPendingIntentBySource, closePool, createAppointment, deferConversationTurnSend, deleteContactData, deleteMessagesOlderThan, getContactIdentifiers, getContactJid, getConversationEffect, getPendingIntent, getRecentConversation, getRecoveryHighWaterMark, getShoppingCart, getUpcomingAppointments, isChatBotPaused, listActiveInventory, listOrdersForContact, markConversationTurnFailed, markConversationTurnSent, markConversationTurnSentByOutboundId, markConversationTurnUncertain, markStaleSendingUncertain, pool, prepareConversationReply, releaseRecoveryClaim, rescheduleAppointmentForContact, resumeConversationTurn, savePendingIntent, StoredMessage } from './db'
+import { applyShoppingCartActionVerified, assertConversationEngineSchema, assertPublicOrderSchema, beginConversationTurnSend, cancelAppointmentById, claimConversationTurn, claimRecoverableConversationTurnsPage, cleanupOperationalRecords, clearAllConversationHistory as clearConversationHistoryData, clearPendingIntent, clearPendingIntentBySource, closePool, createAppointment, createWhatsAppOrderFromCartVerified, deferConversationTurnSend, deleteContactData, deleteMessagesOlderThan, expireOrderReservations, getActiveInventoryImageUrl, getContactIdentifiers, getContactJid, getConversationEffect, getOrderConversationSummary, getPendingIntent, getRecentConversation, getRecoveryHighWaterMark, getShoppingCart, getUpcomingAppointments, isChatBotPaused, listActiveInventory, listOrdersForContact, markConversationTurnFailed, markConversationTurnSent, markConversationTurnSentByOutboundId, markConversationTurnUncertain, markStaleSendingUncertain, pool, prepareConversationReply, releaseRecoveryClaim, rescheduleAppointmentForContact, resumeConversationTurn, savePendingIntent, StoredMessage } from './db'
+import { ConflictError } from './errors'
 import { AppointmentPromptSettings, DeepSeekModel, generateDeepSeekResponse } from './deepseek'
 import { ConversationEntry, mergeConversationTurns, RecentConversationMemory } from './conversation'
-import { authorizeCartMutation, classifyPendingInput, detectCartAction, formatCatalog, formatVerifiedCart, isAffirmative, isPendingIntentCompatible, KeyedSerialExecutor, PendingIntent, resolveInventorySelection, selectedOption } from './conversation-flow'
+import { authorizeCartMutation, classifyPendingInput, detectCartAction, detectCheckoutRequest, formatCatalog, formatCheckoutConfirmation, formatVerifiedCart, hasCartMutationAlongsideCheckout, inventorySelectionIndex, isAffirmative, isInventoryRecommendationQuestion, isPendingIntentCompatible, KeyedSerialExecutor, PendingIntent, resolveInventorySelection, selectedItemQuantity, selectedOption, wantsToBuySelectedItem } from './conversation-flow'
 import { formatAppointmentLocal, resolveAppointmentStart, resolveRelativeAppointmentText } from './appointment-time'
-import { catalogImageUrlForOutcome, catalogOutcome, finalizeProviderConversation, resolveDeterministicOrProvider } from './conversation-reply'
+import { catalogImageUrlForOutcome, catalogOutcome, finalizeProviderConversation, formatVerifiedRecommendations, resolveDeterministicOrProvider } from './conversation-reply'
 import { isIndividualJid } from './identity'
 import { logger } from './logger'
 import { isMessageAtOrAfterStart, isNonContentProtocolType, normalizeMessage, shouldAutoReply, timestampDate } from './message'
@@ -50,7 +51,7 @@ let lastDisconnectCode: number | null = null
 const knownNames = new Map<string, string>()
 const sharedPhoneJids = new Map<string,string>()
 const liveConversationMessageKeys=new Set<string>()
-const defaultAppSettings: AppSettings = { botName: 'Asistente de WhatsApp', businessName: 'Mi negocio', autoReply: config.autoReply, responseMode: 'fixed', responseText: 'HOLA SOY EL BOT', replyDelayMs: config.replyDelayMs, saveToDatabase: true, deepseekApiKey: '', deepseekModel: 'deepseek-flash', aiTone: 'professional', aiResponseLength: 'brief', aiSystemInstructions: '', maxRepliesPerHour: 20, messageRetentionDays: 0, productCatalogImageUrl: null, serviceCatalogImageUrl: null, transferEnabled: false, transferBankName: '', transferAccountHolder: '', transferAccountNumber: '', transferClabe: '', transferInstructions: '', appointmentsEnabled: false, appointmentTimeZone: 'America/Mexico_City', appointmentDays: [1, 2, 3, 4, 5], appointmentStartTime: '09:00', appointmentEndTime: '17:00', appointmentDurationMinutes: 60 }
+const defaultAppSettings: AppSettings = { botName: 'Asistente de WhatsApp', businessName: 'Mi negocio', autoReply: config.autoReply, responseMode: 'fixed', responseText: 'HOLA SOY EL BOT', replyDelayMs: config.replyDelayMs, saveToDatabase: true, deepseekApiKey: '', deepseekModel: 'deepseek-flash', aiTone: 'professional', aiResponseLength: 'brief', aiSystemInstructions: '', maxRepliesPerHour: 20, messageRetentionDays: 0, orderReservationMinutes:15,productCatalogImageUrl: null, serviceCatalogImageUrl: null, transferEnabled: false, transferBankName: '', transferAccountHolder: '', transferAccountNumber: '', transferClabe: '', transferInstructions: '', appointmentsEnabled: false, appointmentTimeZone: 'America/Mexico_City', appointmentDays: [1, 2, 3, 4, 5], appointmentStartTime: '09:00', appointmentEndTime: '17:00', appointmentDurationMinutes: 60 }
 let waVersion: [number, number, number] | undefined
 let processStartedAtSeconds = 0
 let conversationClearInProgress=false
@@ -59,6 +60,7 @@ interface RuntimeSnapshot { version:number; settings:AppSettings }
 let runtimeSnapshot: RuntimeSnapshot = { version:0, settings:defaultAppSettings }
 let configServer: Awaited<ReturnType<typeof launchConfigUi>> | undefined
 let retentionTimer: NodeJS.Timeout | undefined
+let reservationTimer:NodeJS.Timeout|undefined
 let socketGeneration=0
 let recoveryGeneration=0
 let recoveryController:AbortController|undefined
@@ -160,7 +162,7 @@ function appointmentLabel(item: { startsAt:Date; serviceRequested:string|null },
 
 function isCommittedOutcome(outcomeKind:string|null|undefined):boolean{return ['action_applied','cart_applied','recovered_action'].includes(outcomeKind??'')}
 
-async function sendPreparedTurn(current:ReturnType<typeof makeWASocket>,turn:{id:number;settingsVersion:number;outcomeKind?:string|null;outboundText:string|null;outboundMessageId:string|null},quoted:WAMessage|undefined,jid:string,options:{recovery?:boolean;signal?:AbortSignal;recoveryToken?:string}={}):Promise<void>{
+async function sendPreparedTurn(current:ReturnType<typeof makeWASocket>,turn:{id:number;jid?:string;waMessageId?:string;settingsVersion:number;outcomeKind?:string|null;outboundText:string|null;outboundMessageId:string|null},quoted:WAMessage|undefined,jid:string,options:{recovery?:boolean;signal?:AbortSignal;recoveryToken?:string}={}):Promise<void>{
   if(!turn.outboundText||!turn.outboundMessageId)return
   const active=runtimeSnapshot.settings
   if(turn.settingsVersion!==runtimeSnapshot.version&&!isCommittedOutcome(turn.outcomeKind)){await markConversationTurnFailed(turn.id,'settings_changed',options.recoveryToken);return}
@@ -172,7 +174,13 @@ async function sendPreparedTurn(current:ReturnType<typeof makeWASocket>,turn:{id
   if(!(await beginConversationTurnSend(turn.id,options.recoveryToken)))return
   if(options.signal?.aborted||socket!==current){await deferConversationTurnSend(turn.id,options.recoveryToken);return}
   const outboundText=turn.outboundText,outboundMessageId=turn.outboundMessageId
-  const catalogImageUrl=catalogImageUrlForOutcome(turn.outcomeKind,active)
+  let catalogImageUrl=catalogImageUrlForOutcome(turn.outcomeKind,active)
+  if(!catalogImageUrl&&turn.waMessageId){
+    try{
+      const pending=await getPendingIntent(jid)
+      if(pending?.sourceMessageId===turn.waMessageId&&pending.intent.kind==='inventory_selected')catalogImageUrl=await getActiveInventoryImageUrl(pending.intent.sku)
+    }catch{}
+  }
   const delivery=await deliverWithStableId(outboundMessageId,async messageId=>{
     const content=catalogImageUrl?{image:{url:catalogImageUrl},caption:outboundText}:{text:outboundText}
     const sent=await current.sendMessage(jid,content,quoted?{quoted,messageId}:{messageId})
@@ -193,7 +201,7 @@ async function recoverConversationTurns(current:ReturnType<typeof makeWASocket>,
       if(signal.aborted||socket!==current)return
       let currentTurn=turn
       if(['received','processing','action_applied'].includes(turn.status)){
-        const recovered=await recoverVerifiedEffect(turn.id,turn.jid,runtimeSnapshot.settings)
+        const recovered=await recoverVerifiedEffect(turn.id,turn.jid,turn.waMessageId,runtimeSnapshot.settings)
         const text=recovered??'La operación se interrumpió antes de poder completarse. No confirmé ningún cambio; envía nuevamente tu solicitud.'
         const outboundMessageId=stableOutboundId(turn.jid,turn.waMessageId)
         if(!recovered){
@@ -209,7 +217,7 @@ async function recoverConversationTurns(current:ReturnType<typeof makeWASocket>,
 }
 
 async function clearConversationHistory():Promise<{messages:number;chats:number;turns:number}>{
-  if(conversationClearInProgress)throw new Error('Ya se está vaciando el historial.')
+  if(conversationClearInProgress)throw new ConflictError('Ya se está vaciando el historial.','CONVERSATION_CLEAR_IN_PROGRESS')
   conversationClearInProgress=true
   try{
     await recoveryBarrier.catch(()=>undefined)
@@ -243,6 +251,29 @@ async function isTurnAuthorized(jid:string,settingsVersion:number):Promise<boole
   try{return !(await isChatBotPaused(jid))}catch{return false}
 }
 
+function formatCartReply(result:Awaited<ReturnType<typeof applyShoppingCartActionVerified>>,action:Parameters<typeof formatVerifiedCart>[1]):string{
+  const text=formatVerifiedCart(result,action)
+  return result.status==='success'&&result.value.cart.length&&action!=='show'?`${text}\n\nCuando termines, dime “finalizar pedido”.`:text
+}
+
+function formatCreatedOrder(order:{publicId:string;total:string|null;currency:string|null;expiresAt:Date|null}):string{
+  const total=order.total===null?'Total por revisar antes del pago.':`Total: ${order.total} ${order.currency}.`
+  const expiry=order.expiresAt?` Reservé las existencias hasta ${order.expiresAt.toISOString()}.`:''
+  return `Pedido ${order.publicId} creado en estado pendiente. ${total}${expiry} No se realizó ningún cobro.`
+}
+
+function formatRecoveredOrder(order:{publicId:string;status:string;total:string|null;currency:string|null;expiresAt:Date|null}):string{
+  const total=order.total===null?'total por revisar':`${order.total} ${order.currency}`
+  const expiry=order.status==='pending'&&order.expiresAt?` La reserva vence ${order.expiresAt.toISOString()}.`:''
+  return `Pedido ${order.publicId} registrado. Estado actual: ${order.status}. Total: ${total}.${expiry} No se realizó ningún cobro automático.`
+}
+
+async function addSelectedInventoryToCart(jid:string,sku:string,quantity:number,turnId:number,settingsVersion:number,pendingSourceMessageId:string):Promise<{handled:true;text:string;actionApplied?:boolean}>{
+  if(!(await isTurnAuthorized(jid,settingsVersion)))return {handled:true,text:'La atención automática fue pausada. No realicé cambios.'}
+  const result=await applyShoppingCartActionVerified(jid,'add',[{sku,quantity}],`turn:${turnId}:pending-inventory-cart`,pendingSourceMessageId)
+  return {handled:true,text:formatCartReply(result,'add'),actionApplied:result.status==='success'}
+}
+
 async function resolvePendingIntent(jid:string,messageId:string,input:string,settings:AppSettings,settingsVersion:number,turnId:number):Promise<{handled:boolean;text?:string;actionApplied?:boolean}>{
   const record=await getPendingIntent(jid)
   if(!record)return {handled:false}
@@ -252,21 +283,53 @@ async function resolvePendingIntent(jid:string,messageId:string,input:string,set
     await clearPendingIntent(jid)
     return route==='new_request'?{handled:false}:{handled:true,text:'La configuración de agenda cambió. No realicé la operación; inicia nuevamente la solicitud.'}
   }
-  if(route==='new_request'){await clearPendingIntent(jid);return {handled:false}}
+  if(route==='new_request'){
+    if((pending.kind==='inventory_selection'||pending.kind==='inventory_selected')&&isInventoryRecommendationQuestion(input))return {handled:false}
+    await clearPendingIntent(jid);return {handled:false}
+  }
   if(route==='cancel'){await clearPendingIntent(jid);return {handled:true,text:'Entendido. Abandoné la operación pendiente y no realicé cambios.'}}
+  if(route==='answer')await savePendingIntent(jid,{intent:pending,sourceMessageId:messageId})
   if(pending.kind==='inventory_selection'){
-    const result=resolveInventorySelection(pending,input,await listActiveInventory(null))
-    if(result.status==='success'||result.status==='not_found')await clearPendingIntent(jid)
-    return {handled:true,text:result.text}
+    const choice=inventorySelectionIndex(input,pending.candidates)
+    if(choice===null)return {handled:true,text:`Elige una opción:\n${pending.candidates.map((item,index)=>`${index+1}. ${item.name} (${item.sku})`).join('\n')}`}
+    const selected=pending.candidates[choice]
+    const result=resolveInventorySelection(pending,String(choice+1),await listActiveInventory(null))
+    if(result.status!=='success'){await clearPendingIntent(jid);return {handled:true,text:result.text}}
+    if(wantsToBuySelectedItem(input)){
+      const quantity=selectedItemQuantity(input)
+      if(quantity===null)return {handled:true,text:'Indica una cantidad entera entre 1 y 100.'}
+      return addSelectedInventoryToCart(jid,selected.sku,quantity,turnId,settingsVersion,messageId)
+    }
+    await savePendingIntent(jid,{intent:{kind:'inventory_selected',sku:selected.sku,name:selected.name,expiresAt:pendingExpiry()},sourceMessageId:messageId})
+    return {handled:true,text:`${result.text}\nSi quieres agregarlo al carrito, dime “lo quiero”.`}
+  }
+  if(pending.kind==='inventory_selected'){
+    const item=(await listActiveInventory(null)).find(entry=>entry.sku===pending.sku&&entry.isActive)
+    if(!item){await clearPendingIntent(jid);return {handled:true,text:'Ese artículo ya no está activo en el catálogo. Dime qué producto buscas.'}}
+    if(wantsToBuySelectedItem(input)){
+      const quantity=selectedItemQuantity(input)
+      if(quantity===null)return {handled:true,text:'Indica una cantidad entera entre 1 y 100.'}
+      return addSelectedInventoryToCart(jid,pending.sku,quantity,turnId,settingsVersion,messageId)
+    }
+    return {handled:true,text:`Tengo seleccionado ${item.name} (${item.sku}). Si quieres agregarlo al carrito, dime “lo quiero”.`}
   }
   if(pending.kind==='cart_selection'){
     const choice=selectedOption(input,pending.candidates.length)
     if(choice===null)return {handled:true,text:`Elige una opción:\n${pending.candidates.map((item,index)=>`${index+1}. ${item.name} (${item.sku})`).join('\n')}`}
     const selected=pending.candidates[choice]
     if(!(await isTurnAuthorized(jid,settingsVersion)))return {handled:true,text:'La atención automática fue pausada. No realicé cambios.'}
-    const result=await applyShoppingCartActionVerified(jid,pending.action,[{sku:selected.sku,quantity:pending.quantity,...pending.removeAll?{removeAll:true}:{}}],`turn:${turnId}:pending-cart`)
-    await clearPendingIntent(jid)
-    return {handled:true,text:formatVerifiedCart(result,pending.action),actionApplied:result.status==='success'}
+    const result=await applyShoppingCartActionVerified(jid,pending.action,[{sku:selected.sku,quantity:pending.quantity,...pending.removeAll?{removeAll:true}:{}}],`turn:${turnId}:pending-cart`,messageId)
+    return {handled:true,text:formatCartReply(result,pending.action),actionApplied:result.status==='success'}
+  }
+  if(pending.kind==='checkout_confirmation'){
+    if(!isAffirmative(input))return {handled:true,text:'Confirma con “sí” para crear el pedido y reservar existencias, o responde “no”.'}
+    if(!(await isTurnAuthorized(jid,settingsVersion)))return {handled:true,text:'La atención automática fue pausada. No creé el pedido.'}
+    const result=await createWhatsAppOrderFromCartVerified(jid,pending.reservationMinutes,pending.cart,`turn:${turnId}:pending-order-create`,messageId)
+    if(result.status==='success'){
+      return {handled:true,text:formatCreatedOrder(result.value),actionApplied:true}
+    }
+    if(result.status!=='infrastructure_error')await clearPendingIntentBySource(jid,messageId)
+    return {handled:true,text:result.message}
   }
   if(pending.kind==='appointment_book_confirmation'){
     if(route==='correction'){
@@ -281,8 +344,7 @@ async function resolvePendingIntent(jid:string,messageId:string,input:string,set
     try{
       if(!(await isTurnAuthorized(jid,settingsVersion)))return {handled:true,text:'La atención automática fue pausada. No realicé cambios.'}
       const local=resolveAppointmentStart(pending.localStart,{timeZone:settings.appointmentTimeZone,days:settings.appointmentDays,startTime:settings.appointmentStartTime,endTime:settings.appointmentEndTime,durationMinutes:settings.appointmentDurationMinutes})
-      const result=await createAppointment(jid,local.toUTC().toJSDate(),local.plus({minutes:settings.appointmentDurationMinutes}).toUTC().toJSDate(),pending.service,`turn:${turnId}:pending-appointment-book`)
-      await clearPendingIntent(jid)
+      const result=await createAppointment(jid,local.toUTC().toJSDate(),local.plus({minutes:settings.appointmentDurationMinutes}).toUTC().toJSDate(),pending.service,`turn:${turnId}:pending-appointment-book`,messageId)
       return result.booked
         ? {handled:true,text:`Cita agendada para ${local.setLocale('es').toFormat('cccc dd LLL yyyy, HH:mm')} (${settings.appointmentTimeZone}), duración ${settings.appointmentDurationMinutes} minutos${pending.service?`, servicio: ${pending.service}`:''}. No se realizó ningún cobro.`,actionApplied:true}
         : {handled:true,text:'Ese horario ya está ocupado. Indica otra fecha y hora para revisar disponibilidad.'}
@@ -305,8 +367,7 @@ async function resolvePendingIntent(jid:string,messageId:string,input:string,set
     if(!isAffirmative(input))return {handled:true,text:`Confirma con “sí” para cancelar ${pending.label}, o responde “no”.`}
     try{
       if(!(await isTurnAuthorized(jid,settingsVersion)))return {handled:true,text:'La atención automática fue pausada. No realicé cambios.'}
-      const result=await cancelAppointmentById(jid,pending.appointmentId,`turn:${turnId}:pending-appointment-cancel`)
-      await clearPendingIntent(jid)
+      const result=await cancelAppointmentById(jid,pending.appointmentId,`turn:${turnId}:pending-appointment-cancel`,messageId)
       return result.status==='success'?{handled:true,text:`Cita cancelada: ${appointmentLabel(result.value,settings)}.`,actionApplied:true}:{handled:true,text:result.message}
     }catch{return {handled:true,text:'No pude comprobar ni completar la cancelación. La cita no se confirmó como cancelada.'}}
   }
@@ -323,21 +384,24 @@ async function resolvePendingIntent(jid:string,messageId:string,input:string,set
     try{
       if(!(await isTurnAuthorized(jid,settingsVersion)))return {handled:true,text:'La atención automática fue pausada. No realicé cambios.'}
       const local=resolveAppointmentStart(pending.localStart,{timeZone:settings.appointmentTimeZone,days:settings.appointmentDays,startTime:settings.appointmentStartTime,endTime:settings.appointmentEndTime,durationMinutes:settings.appointmentDurationMinutes})
-      const result=await rescheduleAppointmentForContact(jid,pending.appointmentId,local.toUTC().toJSDate(),local.plus({minutes:settings.appointmentDurationMinutes}).toUTC().toJSDate(),`turn:${turnId}:pending-appointment-reschedule`)
-      await clearPendingIntent(jid)
+      const result=await rescheduleAppointmentForContact(jid,pending.appointmentId,local.toUTC().toJSDate(),local.plus({minutes:settings.appointmentDurationMinutes}).toUTC().toJSDate(),`turn:${turnId}:pending-appointment-reschedule`,messageId)
       return result.status==='success'?{handled:true,text:`Cita reprogramada para ${appointmentLabel(result.value,settings)}.`,actionApplied:true}:{handled:true,text:result.message}
     }catch{return {handled:true,text:'No pude comprobar ni completar la reprogramación. La cita conserva su horario anterior.'}}
   }
   return {handled:false}
 }
 
-async function recoverVerifiedEffect(turnId:number,jid:string,settings:AppSettings):Promise<string|null>{
+async function recoverVerifiedEffect(turnId:number,jid:string,sourceMessageId:string,settings:AppSettings):Promise<string|null>{
   const effect=await getConversationEffect(turnId)
   if(!effect)return null
-  if(effect.effectKey.includes(':pending-'))await clearPendingIntent(jid)
+  if(effect.effectKey.includes(':pending-'))await clearPendingIntentBySource(jid,sourceMessageId)
   if(effect.effectType.startsWith('cart:')){
     const action=effect.effectType.slice(5) as 'add'|'remove'|'clear'|'show'
-    return formatVerifiedCart(effect.result.changed?{status:'success',value:{cart:effect.result.cart,changed:true}}:{status:'rejected',message:'No se pudo aplicar el cambio solicitado al carrito.'},action)
+    return formatCartReply(effect.result.changed?{status:'success',value:{cart:effect.result.cart,changed:true}}:{status:'rejected',message:'No se pudo aplicar el cambio solicitado al carrito.'},action)
+  }
+  if(effect.effectType==='order:create'){
+    const current=await getOrderConversationSummary(jid,Number(effect.result.orderId))
+    return current?formatRecoveredOrder(current):formatCreatedOrder({...effect.result,expiresAt:effect.result.expiresAt?new Date(effect.result.expiresAt):null})
   }
   if(effect.effectType==='appointment:book'){
     if(!effect.result.booked)return 'Ese horario ya está ocupado. Indica otra fecha y hora.'
@@ -362,8 +426,8 @@ async function processAutoReply(current:ReturnType<typeof makeWASocket>,message:
     if(claimed.turn.status==='send_pending'){await sendPreparedTurn(current,claimed.turn,message,jid);return}
     if(claimed.turn.status==='uncertain')return
     else if(['received','processing','action_applied'].includes(claimed.turn.status)){
-      const recovered=await recoverVerifiedEffect(claimed.turn.id,jid,snapshot.settings)
-      if(recovered){const outboundMessageId=stableOutboundId(jid,messageId);await prepareConversationReply(claimed.turn.id,'recovered_action',recovered,outboundMessageId,true);await sendPreparedTurn(current,{id:claimed.turn.id,settingsVersion:claimed.turn.settingsVersion,outcomeKind:'recovered_action',outboundText:recovered,outboundMessageId},message,jid);return}
+      const recovered=await recoverVerifiedEffect(claimed.turn.id,jid,messageId,snapshot.settings)
+      if(recovered){const outboundMessageId=stableOutboundId(jid,messageId);await prepareConversationReply(claimed.turn.id,'recovered_action',recovered,outboundMessageId,true);await sendPreparedTurn(current,{id:claimed.turn.id,jid,waMessageId:messageId,settingsVersion:claimed.turn.settingsVersion,outcomeKind:'recovered_action',outboundText:recovered,outboundMessageId},message,jid);return}
       if(claimed.turn.status==='action_applied')return
        if(!(await resumeConversationTurn(claimed.turn.id,snapshot.version)))return
        await clearPendingIntentBySource(jid,messageId)
@@ -388,7 +452,39 @@ async function processAutoReply(current:ReturnType<typeof makeWASocket>,message:
       if(pending.handled){answer=pending.text!;actionApplied=!!pending.actionApplied;outcome=actionApplied?'action_applied':'pending_intent'}
       else{
         try{
-          const routed=await resolveDeterministicOrProvider(input,snapshot.settings,{
+          const directCartAction=detectCartAction(input)
+          const checkoutRequested=detectCheckoutRequest(input)
+          const combinesCartMutation=hasCartMutationAlongsideCheckout(input)
+          if(combinesCartMutation){
+            answer='Solicitaste modificar el carrito y finalizar el pedido en el mismo mensaje. Primero indica el cambio del carrito y después envía “finalizar pedido”. No realicé cambios.'
+            outcome='ambiguous'
+          }else if(checkoutRequested){
+            const cart=await getShoppingCart(jid)
+            answer=formatCheckoutConfirmation(cart)
+            if(cart.length){
+              await savePendingIntent(jid,{intent:{kind:'checkout_confirmation',cart,reservationMinutes:snapshot.settings.orderReservationMinutes,expiresAt:pendingExpiry()},sourceMessageId:messageId})
+              outcome='confirmation_required'
+            }else outcome='rejected'
+          }else if(directCartAction!=='none'){
+            const [inventory,cart]=await Promise.all([listActiveInventory(null),getShoppingCart(jid)])
+            const authorization=authorizeCartMutation(input,directCartAction,[],inventory,cart)
+            if(authorization.result.status==='success'){
+              if(!(await isTurnAuthorized(jid,snapshot.version))){await markConversationTurnFailed(turn.id,'authorization_changed_before_action');return}
+              const verified=await applyShoppingCartActionVerified(jid,authorization.result.value.action,authorization.result.value.items,`turn:${turn.id}:cart`)
+              answer=formatCartReply(verified,authorization.result.value.action)
+              actionApplied=verified.status==='success'&&authorization.result.value.action!=='show'
+              outcome=actionApplied?'cart_applied':verified.status==='success'?'cart_data':verified.status
+            }else{
+              answer=authorization.result.message
+              if(authorization.result.status==='ambiguous'&&authorization.candidates?.length){
+                const intent:PendingIntent={kind:'cart_selection',action:directCartAction==='remove'?'remove':'add',candidates:authorization.candidates,quantity:authorization.quantity??1,removeAll:authorization.removeAll,expiresAt:pendingExpiry()}
+                await savePendingIntent(jid,{intent,sourceMessageId:messageId})
+                answer+=`\n${authorization.result.options.join('\n')}`
+              }
+              outcome=authorization.result.status
+            }
+          }else{
+            const routed=await resolveDeterministicOrProvider(input,snapshot.settings,{
             listInventory:()=>listActiveInventory(null),
             listOrders:()=>listOrdersForContact(jid),
           },async()=>{
@@ -407,6 +503,10 @@ async function processAutoReply(current:ReturnType<typeof makeWASocket>,message:
             answer=routed.reply.text;outcome=routed.reply.outcome
             if(routed.reply.inventoryCandidates?.length){
               await savePendingIntent(jid,{intent:{kind:'inventory_selection',candidates:routed.reply.inventoryCandidates,expiresAt:pendingExpiry()},sourceMessageId:messageId})
+            }else if(routed.reply.selectedInventory){
+              const selected=routed.reply.selectedInventory
+              await savePendingIntent(jid,{intent:{kind:'inventory_selected',sku:selected.sku,name:selected.name,expiresAt:pendingExpiry()},sourceMessageId:messageId})
+              answer+=`\nSi quieres agregarlo al carrito, dime “lo quiero”.`
             }
           }else{
           const {generated,inventory,cart}=routed.value
@@ -428,7 +528,7 @@ async function processAutoReply(current:ReturnType<typeof makeWASocket>,message:
             if(authorization.result.status==='success'){
               if(!(await isTurnAuthorized(jid,snapshot.version))){await markConversationTurnFailed(turn.id,'authorization_changed_before_action');return}
               const verified=await applyShoppingCartActionVerified(jid,authorization.result.value.action,authorization.result.value.items,`turn:${turn.id}:cart`)
-              answer=formatVerifiedCart(verified,authorization.result.value.action);actionApplied=verified.status==='success';outcome=actionApplied?'cart_applied':verified.status
+              answer=formatCartReply(verified,authorization.result.value.action);actionApplied=verified.status==='success'&&authorization.result.value.action!=='show';outcome=actionApplied?'cart_applied':verified.status==='success'?'cart_data':verified.status
             }else{
               answer=authorization.result.message
               if(authorization.result.status==='ambiguous'&&authorization.candidates?.length){
@@ -479,17 +579,29 @@ async function processAutoReply(current:ReturnType<typeof makeWASocket>,message:
               await savePendingIntent(jid,{intent:{kind:'appointment_reschedule_confirmation',appointmentId,localStart:proposedAppointmentStart,label:'la cita seleccionada',settingsVersion:snapshot.version,timeZone:snapshot.settings.appointmentTimeZone,expiresAt:pendingExpiry()},sourceMessageId:messageId})
               answer=`¿Confirmas reprogramar la cita seleccionada a ${proposedAppointmentStart} (${snapshot.settings.appointmentTimeZone})? Responde “sí” o “no”.`;outcome='confirmation_required'
             }
+          }else if(generated.productSkus.length){
+            const allowedSkus=existingPending?.intent.kind==='inventory_selection'?new Set(existingPending.intent.candidates.map(item=>item.sku))
+              :existingPending?.intent.kind==='inventory_selected'?new Set([existingPending.intent.sku]):null
+            const recommended=generated.productSkus.filter(sku=>!allowedSkus||allowedSkus.has(sku))
+              .map(sku=>inventory.find(item=>item.sku===sku&&item.isActive))
+              .filter((item):item is NonNullable<typeof item>=>!!item&&(item.itemType==='service'||item.stockQuantity!==0)).slice(0,2)
+            if(recommended.length){
+              if(recommended.length===1){const item=recommended[0];await savePendingIntent(jid,{intent:{kind:'inventory_selected',sku:item.sku,name:item.name,expiresAt:pendingExpiry()},sourceMessageId:messageId})}
+              else{const candidates=recommended.map(item=>({sku:item.sku,name:item.name}));await savePendingIntent(jid,{intent:{kind:'inventory_selection',candidates,expiresAt:pendingExpiry()},sourceMessageId:messageId})}
+              answer=formatVerifiedRecommendations(recommended);outcome='inventory_recommendation'
+            }else{const conversational=finalizeProviderConversation(generated.text);answer=conversational.text;outcome=conversational.outcome}
           }else{
             const conversational=finalizeProviderConversation(generated.text);answer=conversational.text;outcome=conversational.outcome
           }
           }
-        }catch{answer='No pude comprobar la información ni completar operaciones en este momento. Inténtalo nuevamente.';outcome='infrastructure_error'}
+          }
+        }catch(error){logger.error({err:error,turnId:turn.id,waMessageId:messageId},'Falló una respuesta que necesitaba consultar o modificar MySQL');answer='No pude comprobar la información ni completar operaciones en este momento. Inténtalo nuevamente.';outcome='infrastructure_error'}
       }
     }
   }
   const outboundMessageId=stableOutboundId(jid,messageId)
   await prepareConversationReply(turn.id,outcome,answer,outboundMessageId,actionApplied)
-  await sendPreparedTurn(current,{id:turn.id,settingsVersion:snapshot.version,outcomeKind:outcome,outboundText:answer,outboundMessageId},message,jid)
+  await sendPreparedTurn(current,{id:turn.id,jid,waMessageId:messageId,settingsVersion:snapshot.version,outcomeKind:outcome,outboundText:answer,outboundMessageId},message,jid)
 }
 
 async function startSocket(): Promise<void> {
@@ -558,25 +670,40 @@ async function startSocket(): Promise<void> {
       for (const contact of contacts) if (isIndividualJid(contact.id)) {
         const name = contact.name ?? contact.notify ?? contact.verifiedName
         if (name) knownNames.set(contact.id, name)
+        const jid=contact.jid?.endsWith('@s.whatsapp.net')?contact.jid:contact.id??contact.lid??contact.jid
+        const lid=contact.lid?.endsWith('@lid')?contact.lid:contact.id?.endsWith('@lid')?contact.id:null
+        const phoneJid=contact.jid?.endsWith('@s.whatsapp.net')?contact.jid:contact.id?.endsWith('@s.whatsapp.net')?contact.id:null
+        if(jid&&isIndividualJid(jid)&&(lid||phoneJid))await persist('contact',{jid,lid,phoneJid,name:name??null})
       }
       logger.info({ ignoredHistoricalMessages:messages.length, historicalChats:chats.filter(c=>isIndividualJid(c.id)).length },'Se omitió importar conversaciones anteriores al inicio del servicio')
     } catch (error) { logger.error({ err: error }, 'Error procesando metadatos de historial') }
   })
   current.ev.on('contacts.upsert', async contacts => {
-    try { for (const contact of contacts) if (isIndividualJid(contact.id)) {
+    try { for (const contact of contacts) if (isIndividualJid(contact.id)||isIndividualJid(contact.jid)||isIndividualJid(contact.lid)) {
       const name = contact.name ?? contact.notify ?? contact.verifiedName
-      if (name) { knownNames.set(contact.id, name); await persist('contact', { jid: contact.id, name }) }
+      const jid=contact.jid?.endsWith('@s.whatsapp.net')?contact.jid:contact.id??contact.lid??contact.jid
+      const lid=contact.lid?.endsWith('@lid')?contact.lid:contact.id?.endsWith('@lid')?contact.id:null
+      const phoneJid=contact.jid?.endsWith('@s.whatsapp.net')?contact.jid:contact.id?.endsWith('@s.whatsapp.net')?contact.id:null
+      if(name){for(const identifier of [contact.id,contact.jid,contact.lid])if(identifier&&isIndividualJid(identifier))knownNames.set(identifier,name)}
+      if(jid&&isIndividualJid(jid))await persist('contact',{jid,lid,phoneJid,name:name??null})
     } }
     catch (error) { logger.error({ err: error }, 'Error procesando contacts.upsert') }
   })
   current.ev.on('contacts.update', async updates => {
-    try { for (const contact of updates) if (contact.id && isIndividualJid(contact.id) && contact.name) {
-      knownNames.set(contact.id, contact.name)
-      await persist('contact', { jid: contact.id, name: contact.name })
+    try { for (const contact of updates) if (isIndividualJid(contact.id)||isIndividualJid(contact.jid)||isIndividualJid(contact.lid)) {
+      const jid=contact.jid?.endsWith('@s.whatsapp.net')?contact.jid:contact.id??contact.lid??contact.jid
+      const lid=contact.lid?.endsWith('@lid')?contact.lid:contact.id?.endsWith('@lid')?contact.id:null
+      const phoneJid=contact.jid?.endsWith('@s.whatsapp.net')?contact.jid:contact.id?.endsWith('@s.whatsapp.net')?contact.id:null
+      if(contact.name)for(const identifier of [contact.id,contact.jid,contact.lid])if(identifier&&isIndividualJid(identifier))knownNames.set(identifier,contact.name)
+      if(jid&&isIndividualJid(jid))await persist('contact',{jid,lid,phoneJid,name:contact.name??null})
     } }
     catch (error) { logger.error({ err: error }, 'Error procesando contacts.update') }
   })
-  current.ev.on('chats.phoneNumberShare', event => { if(isIndividualJid(event.lid)&&isIndividualJid(event.jid))sharedPhoneJids.set(event.lid,event.jid) })
+  current.ev.on('chats.phoneNumberShare', async event => {
+    if(!event.lid?.endsWith('@lid')||!event.jid?.endsWith('@s.whatsapp.net'))return
+    sharedPhoneJids.set(event.lid,event.jid)
+    await persist('contact',{jid:event.jid,lid:event.lid,phoneJid:event.jid,name:knownNames.get(event.lid)??null})
+  })
   current.ev.on('messages.upsert', async ({ messages, type }) => {
     const tasks=messages.map(async message=>{
       try{
@@ -626,6 +753,17 @@ async function applyRuntimeSettings(settings:AppSettings):Promise<void>{
   runtimeSnapshot={version:settingsVersion(settings),settings:structuredClone(settings)}
   databaseEnabled = settings.saveToDatabase
   if(retentionTimer){clearInterval(retentionTimer);retentionTimer=undefined}
+  if(reservationTimer){clearInterval(reservationTimer);reservationTimer=undefined}
+  let reservationCleanupRunning=false
+  const expireReservations=async()=>{
+    if(reservationCleanupRunning)return
+    reservationCleanupRunning=true
+    try{const expiredOrders=await expireOrderReservations();if(expiredOrders)logger.info({expiredOrders},'Reservas de pedidos expiradas')}
+    catch(error){logger.error({err:error},'Falló la expiración de reservas de pedidos')}
+    finally{reservationCleanupRunning=false}
+  }
+  void expireReservations()
+  reservationTimer=setInterval(()=>{void expireReservations()},60_000);reservationTimer.unref()
   if(serviceEnabled&&(databaseEnabled||settings.autoReply)){
     if(databaseEnabled){
       if(!queueInitialized){await queue.initialize();queueInitialized=true}
@@ -643,7 +781,7 @@ async function applyRuntimeSettings(settings:AppSettings):Promise<void>{
 }
 
 async function startConfiguredService(settings: AppSettings): Promise<void> {
-  if (serviceEnabled || socket) throw new Error('El servicio de WhatsApp ya está iniciado')
+  if (serviceEnabled || socket) throw new ConflictError('El servicio de WhatsApp ya está iniciado.','SERVICE_ALREADY_STARTED')
   stopping = false
   loggedOut = false
   serviceEnabled = true
@@ -656,6 +794,7 @@ async function startConfiguredService(settings: AppSettings): Promise<void> {
     const needsDatabase = databaseEnabled || settings.autoReply
     if (needsDatabase) {
       await pool.query('SELECT 1')
+      await assertPublicOrderSchema()
       if(settings.autoReply)await assertConversationEngineSchema()
       logger.info('Conexión MySQL verificada')
     }
@@ -692,9 +831,9 @@ async function logoutWhatsApp(): Promise<void> {
 }
 
 async function sendManualMessage(contactId: number, payload:ManualMessage): Promise<void> {
-  if (!socket || serviceStatus !== 'connected') throw new Error('WhatsApp no está conectado')
+  if (!socket || serviceStatus !== 'connected') throw new ConflictError('WhatsApp no está conectado.','WHATSAPP_NOT_CONNECTED')
   const jid = await getContactJid(contactId)
-  if (!jid||!isIndividualJid(jid)) throw new Error('El contacto no tiene un chat individual de WhatsApp disponible')
+  if (!jid||!isIndividualJid(jid)) throw new ConflictError('El contacto no tiene un chat individual de WhatsApp disponible.','CONTACT_CHAT_UNAVAILABLE')
   const content=payload.image
     ?{image:payload.image,mimetype:payload.mimeType??'image/jpeg',...(payload.text?{caption:payload.text}:{})}
     :{text:payload.text}
@@ -704,7 +843,7 @@ async function sendManualMessage(contactId: number, payload:ManualMessage): Prom
 
 async function deleteContact(contactId: number): Promise<boolean> {
   const identifiers=await getContactIdentifiers(contactId)
-  if(!identifiers.length)return false
+  if(!identifiers.length)return deleteContactData(contactId)
   const jids=[...new Set(identifiers.map(item=>item.jid))].sort()
   await queue.suppressAndDiscard(jids)
   const runLocked=async(index:number):Promise<boolean>=>index===jids.length
@@ -724,6 +863,7 @@ async function shutdown(signal: string): Promise<void> {
   logger.info({ signal }, 'Cerrando proceso')
   if (reconnectTimer) clearTimeout(reconnectTimer)
   if (retentionTimer) clearInterval(retentionTimer)
+  if (reservationTimer) clearInterval(reservationTimer)
   if (recoveryTimer) clearInterval(recoveryTimer)
   recoveryController?.abort();socketGeneration++
   try { socket?.end(undefined) } catch {}

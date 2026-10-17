@@ -1,6 +1,7 @@
 import { $, api, setNotice } from '../api.js'
 import { saveSettings } from './settings.js'
 import { refreshDashboard, updateConnection } from './dashboard.js'
+import { confirmAction, showToast } from '../ui/dialogs.js?v=dialogs-1'
 
 let busy=false
 
@@ -19,9 +20,9 @@ async function start(){
 }
 
 async function logout(){
-  if(!confirm('¿Cerrar la sesión vinculada y eliminar las credenciales locales? Para volver a conectar tendrás que escanear un QR.'))return
-  try{const result=await api('/api/logout','POST',{});setNotice('globalNotice',result.message,'success');await refreshStatus()}
-  catch(error){setNotice('globalNotice',error.message,'error')}
+  if(!await confirmAction({title:'Desvincular WhatsApp',message:'Se cerrará la sesión y se borrarán las credenciales locales. Para reconectar tendrás que escanear un nuevo QR.',confirmText:'Desvincular',danger:true}))return
+  try{const result=await api('/api/logout','POST',{});setNotice('globalNotice',result.message,'success');showToast(result.message);await refreshStatus()}
+  catch(error){setNotice('globalNotice',error.message,'error');showToast(error.message,'error')}
 }
 
 async function refreshStatus(){

@@ -5,9 +5,13 @@ import { Identity, resolveIdentity } from './identity'
 import { logger } from './logger'
 import type { PendingIntentRecord, VerifiedResult } from './conversation-flow'
 import { decryptLocalValue, encryptLocalValue } from './settings-crypto'
+import { AppError, ConflictError, ExternalServiceError } from './errors'
+import { OrderResult, OrderService, OrderStatus } from './order-service'
+import { randomUUID } from 'node:crypto'
 
 export const pool: Pool = mysql.createPool({ ...config.db, waitForConnections: true, connectionLimit: 8, queueLimit: 0, charset: 'utf8mb4', timezone: 'Z', dateStrings: false })
 pool.on('connection', connection => { connection.query("SET time_zone = '+00:00'") })
+export const orderService = new OrderService(pool)
 
 export async function assertConversationEngineSchema():Promise<void>{
   const [rows]:any=await pool.query(`SELECT COLUMN_NAME AS columnName,COLUMN_TYPE AS columnType
@@ -18,6 +22,13 @@ export async function assertConversationEngineSchema():Promise<void>{
   if(!columns.has('recovery_token')||!columns.has('recovery_lease_until')||!columns.get('status')?.includes("'sending'")){
     throw new Error('El esquema conversacional está desactualizado. Ejecuta npm run migrate antes de iniciar WhatsApp.')
   }
+}
+
+export async function assertPublicOrderSchema():Promise<void>{
+  const [rows]:any=await pool.query(`SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='orders' AND COLUMN_NAME='public_order_key' LIMIT 1`)
+  if(!rows.length)throw new ExternalServiceError('La base MySQL no tiene las migraciones de ventas requeridas. Ejecuta npm run migrate y vuelve a iniciar WhatsApp.','SALES_SCHEMA_OUTDATED')
+  await orderService.assertSchema()
 }
 
 export interface StoredMessage {
@@ -31,19 +42,20 @@ export interface InventoryItemInput {
   price: string | null; currency: string; stockQuantity: number | null; isActive: boolean
 }
 
-export interface InventoryItem extends InventoryItemInput { id: number }
+export interface InventoryItem extends InventoryItemInput { id: number; reservedQuantity?:number; availableQuantity?:number|null }
 export interface CartLine { sku: string; itemType: 'product' | 'service'; itemName: string; quantity: number; unitPrice: string | null; currency: string }
 export interface CartChange { sku: string; quantity: number; removeAll?: boolean }
+export interface PublicOrderItemInput { sku:string; quantity:number }
 export type CartAction = 'add' | 'remove' | 'clear' | 'show' | 'none'
 export interface AppointmentRecord { id: number; startsAt: Date; endsAt: Date; serviceRequested: string | null }
 export interface StoredConversationEntry { id: string; role: 'user' | 'assistant'; content: string; timestampMs: number }
 export type ConversationTurnStatus = 'received'|'processing'|'action_applied'|'send_pending'|'sending'|'sent'|'failed'|'uncertain'
 export interface ConversationTurnRecord { id: number; jid: string; waMessageId: string; status: ConversationTurnStatus; settingsVersion: number; outcomeKind: string | null; outboundText: string | null; outboundMessageId: string | null; sendAttempts: number }
 
-const inventoryColumns = 'id,item_type AS itemType,sku,name,description,image_url AS imageUrl,price,currency,stock_quantity AS stockQuantity,is_active AS isActive'
+const inventoryColumns = 'id,item_type AS itemType,sku,name,description,image_url AS imageUrl,price,currency,stock_quantity AS stockQuantity,reserved_quantity AS reservedQuantity,(stock_quantity-reserved_quantity) AS availableQuantity,is_active AS isActive'
 
 function inventoryRow(row: any): InventoryItem {
-  return { ...row, id: Number(row.id), imageUrl: row.imageUrl ?? null, stockQuantity: row.stockQuantity === null ? null : Number(row.stockQuantity), isActive: Boolean(row.isActive) }
+  return { ...row, id: Number(row.id), imageUrl: row.imageUrl ?? null, stockQuantity: row.stockQuantity === null ? null : Number(row.stockQuantity), reservedQuantity:Number(row.reservedQuantity), availableQuantity:row.availableQuantity===null?null:Number(row.availableQuantity), isActive: Boolean(row.isActive) }
 }
 
 export async function listInventoryItems(): Promise<InventoryItem[]> {
@@ -65,24 +77,66 @@ export async function listActiveInventory(limit: number | null = 40): Promise<In
   const [rows]: any = limit === null
     ? await pool.query(statement)
     : await pool.execute(`${statement} LIMIT ?`, [Math.max(1, Math.min(500, Math.floor(limit)))])
-  return rows.map(inventoryRow)
+  return rows.map(inventoryRow).map((item:InventoryItem)=>({...item,stockQuantity:item.availableQuantity??item.stockQuantity}))
+}
+
+export async function getActiveInventoryImageUrl(sku:string):Promise<string|null>{
+  const [[row]]:any=await pool.execute('SELECT image_url AS imageUrl FROM inventory_items WHERE sku=? AND is_active=1 LIMIT 1',[sku])
+  return typeof row?.imageUrl==='string'&&row.imageUrl.startsWith('https://')?row.imageUrl:null
+}
+
+export async function listActiveInventoryPage(afterId=0,limit=500):Promise<InventoryItem[]>{
+  const [reservationColumn]:any=await pool.query(`SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='inventory_items' AND COLUMN_NAME='reserved_quantity' LIMIT 1`)
+  const reserved=reservationColumn.length?'reserved_quantity':'0'
+  const columns=`id,item_type AS itemType,sku,name,description,image_url AS imageUrl,price,currency,stock_quantity AS stockQuantity,${reserved} AS reservedQuantity,(stock_quantity-${reserved}) AS availableQuantity,is_active AS isActive`
+  const [rows]:any=await pool.execute(`SELECT ${columns} FROM inventory_items WHERE is_active=1 AND id>? ORDER BY id LIMIT ?`,[Math.max(0,Math.floor(afterId)),Math.max(1,Math.min(500,Math.floor(limit)))])
+  return rows.map(inventoryRow).map((item:InventoryItem)=>({...item,stockQuantity:item.availableQuantity??item.stockQuantity}))
 }
 
 export async function createInventoryItem(item: InventoryItemInput): Promise<InventoryItem> {
-  const [result]: any = await pool.execute('INSERT INTO inventory_items (item_type,sku,name,description,image_url,price,currency,stock_quantity,is_active) VALUES (?,?,?,?,?,?,?,?,?)', [item.itemType,item.sku,item.name,item.description,item.imageUrl,item.price,item.currency,item.stockQuantity,item.isActive])
-  const [rows]: any = await pool.execute(`SELECT ${inventoryColumns} FROM inventory_items WHERE id=?`, [result.insertId])
-  return inventoryRow(rows[0])
+  const conn=await pool.getConnection()
+  try{
+    await conn.beginTransaction()
+    const [result]: any = await conn.execute('INSERT INTO inventory_items (item_type,sku,name,description,image_url,price,currency,stock_quantity,is_active) VALUES (?,?,?,?,?,?,?,?,?)', [item.itemType,item.sku,item.name,item.description,item.imageUrl,item.price,item.currency,item.stockQuantity,item.isActive])
+    if(item.stockQuantity!==null&&item.stockQuantity>0)await conn.execute(`INSERT INTO inventory_movements (inventory_item_id,sku,movement_type,quantity,event_key,metadata)
+      VALUES (?,?,'adjustment',?,?,?)`,[result.insertId,item.sku,item.stockQuantity,`inventory:${result.insertId}:adjustment:${randomUUID()}`,JSON.stringify({reason:'initial_stock',from:null,to:item.stockQuantity,delta:item.stockQuantity})])
+    const [rows]: any = await conn.execute(`SELECT ${inventoryColumns} FROM inventory_items WHERE id=?`, [result.insertId])
+    await conn.commit();return inventoryRow(rows[0])
+  }catch(error){await conn.rollback();throw error}finally{conn.release()}
 }
 
 export async function updateInventoryItem(id: number, item: InventoryItemInput): Promise<InventoryItem | null> {
-  await pool.execute('UPDATE inventory_items SET item_type=?,sku=?,name=?,description=?,image_url=?,price=?,currency=?,stock_quantity=?,is_active=? WHERE id=?', [item.itemType,item.sku,item.name,item.description,item.imageUrl,item.price,item.currency,item.stockQuantity,item.isActive,id])
-  const [rows]: any = await pool.execute(`SELECT ${inventoryColumns} FROM inventory_items WHERE id=?`, [id])
-  return rows[0] ? inventoryRow(rows[0]) : null
+  const conn=await pool.getConnection()
+  try{
+    await conn.beginTransaction()
+    const [[current]]:any=await conn.query('SELECT stock_quantity AS stockQuantity,reserved_quantity AS reservedQuantity FROM inventory_items WHERE id=? FOR UPDATE',[id])
+    if(!current){await conn.commit();return null}
+    const reserved=Number(current.reservedQuantity)
+    if(reserved>0&&(item.stockQuantity===null||item.stockQuantity<reserved))throw new ConflictError(`No puedes reducir el stock por debajo de las ${reserved} unidades reservadas.`,'STOCK_BELOW_RESERVED')
+    await conn.execute('UPDATE inventory_items SET item_type=?,sku=?,name=?,description=?,image_url=?,price=?,currency=?,stock_quantity=?,is_active=? WHERE id=?', [item.itemType,item.sku,item.name,item.description,item.imageUrl,item.price,item.currency,item.stockQuantity,item.isActive,id])
+    const previous=current.stockQuantity===null?null:Number(current.stockQuantity)
+    if(previous!==item.stockQuantity){
+      const delta=(item.stockQuantity??0)-(previous??0)
+      await conn.execute(`INSERT INTO inventory_movements (inventory_item_id,sku,movement_type,quantity,event_key,metadata)
+        VALUES (?,?,'adjustment',?,?,?)`,[id,item.sku,Math.abs(delta),`inventory:${id}:adjustment:${randomUUID()}`,JSON.stringify({reason:'admin_update',from:previous,to:item.stockQuantity,delta})])
+    }
+    const [rows]: any = await conn.execute(`SELECT ${inventoryColumns} FROM inventory_items WHERE id=?`, [id])
+    await conn.commit()
+    return rows[0] ? inventoryRow(rows[0]) : null
+  }catch(error){await conn.rollback();throw error}finally{conn.release()}
 }
 
 export async function deleteInventoryItem(id: number): Promise<boolean> {
-  const [result]: any = await pool.execute('DELETE FROM inventory_items WHERE id=?', [id])
-  return result.affectedRows > 0
+  const conn=await pool.getConnection()
+  try{
+    await conn.beginTransaction()
+    const [[item]]:any=await conn.query('SELECT reserved_quantity AS reservedQuantity FROM inventory_items WHERE id=? FOR UPDATE',[id])
+    if(!item){await conn.commit();return false}
+    if(Number(item.reservedQuantity)>0)throw new ConflictError('No puedes eliminar un artículo con unidades reservadas.','ITEM_HAS_RESERVATIONS')
+    const [result]:any=await conn.execute('DELETE FROM inventory_items WHERE id=?',[id])
+    await conn.commit();return result.affectedRows>0
+  }catch(error){await conn.rollback();throw error}finally{conn.release()}
 }
 
 export async function getShoppingCart(jid: string): Promise<CartLine[]> {
@@ -93,7 +147,7 @@ export async function getShoppingCart(jid: string): Promise<CartLine[]> {
   return rows.map((row: any) => ({ ...row, quantity: Number(row.quantity) }))
 }
 
-export async function applyShoppingCartAction(jid: string, action: CartAction, items: CartChange[], effectKey?: string): Promise<CartLine[]> {
+export async function applyShoppingCartAction(jid: string, action: CartAction, items: CartChange[], effectKey?: string,pendingSourceMessageId?:string): Promise<CartLine[]> {
   if (action === 'none') return getShoppingCart(jid)
   if (action === 'show') return getShoppingCart(jid)
   await upsertContactChat(jid)
@@ -104,6 +158,7 @@ export async function applyShoppingCartAction(jid: string, action: CartAction, i
       const [[stored]]: any = await conn.execute('SELECT result_json AS resultJson FROM conversation_effects WHERE effect_key=? FOR UPDATE', [effectKey])
       if (stored) {
         const result = typeof stored.resultJson === 'string' ? JSON.parse(stored.resultJson) : stored.resultJson
+        if(pendingSourceMessageId)await conn.execute('DELETE FROM pending_intents WHERE jid=? AND source_message_id=?',[jid,pendingSourceMessageId])
         await conn.commit()
         return result.cart
       }
@@ -127,11 +182,11 @@ export async function applyShoppingCartAction(jid: string, action: CartAction, i
     if (action === 'add') {
       for (const item of items) {
         if (typeof item.sku !== 'string' || !Number.isInteger(item.quantity) || item.quantity < 1) continue
-        const [[product]]: any = await conn.query('SELECT id,item_type,sku,name,price,currency,stock_quantity FROM inventory_items WHERE sku=? AND is_active=1 FOR UPDATE', [item.sku])
+        const [[product]]: any = await conn.query('SELECT id,item_type,sku,name,price,currency,stock_quantity,reserved_quantity FROM inventory_items WHERE sku=? AND is_active=1 FOR UPDATE', [item.sku])
         if (!product) continue
         const [[current]]: any = await conn.query('SELECT quantity FROM shopping_cart_items WHERE cart_id=? AND sku=? FOR UPDATE', [cart.id, product.sku])
         const currentQuantity = Number(current?.quantity ?? 0)
-        const stockRemaining = product.stock_quantity === null ? 999 : Math.max(0, Number(product.stock_quantity) - currentQuantity)
+        const stockRemaining = product.stock_quantity === null ? 999 : Math.max(0, Number(product.stock_quantity) - Number(product.reserved_quantity) - currentQuantity)
         const addQuantity = Math.min(item.quantity, 100, stockRemaining, 999 - currentQuantity)
         if (addQuantity < 1) continue
         await conn.query(`INSERT INTO shopping_cart_items (cart_id,inventory_item_id,sku,item_type,item_name,quantity,unit_price,currency)
@@ -144,17 +199,18 @@ export async function applyShoppingCartAction(jid: string, action: CartAction, i
     const resultCart = rows.map((row: any) => ({ ...row, quantity: Number(row.quantity) }))
     const changed=JSON.stringify(beforeCart)!==JSON.stringify(resultCart)
     if (effectKey) await conn.execute('INSERT INTO conversation_effects (effect_key,effect_type,result_json) VALUES (?,?,?)', [effectKey,`cart:${action}`,JSON.stringify({ cart:resultCart,changed })])
+    if(pendingSourceMessageId)await conn.execute('DELETE FROM pending_intents WHERE jid=? AND source_message_id=?',[jid,pendingSourceMessageId])
     await conn.commit()
     return resultCart
   } catch (error) { await conn.rollback(); throw error } finally { conn.release() }
 }
 
-export async function applyShoppingCartActionVerified(jid: string, action: CartAction, items: CartChange[], effectKey: string): Promise<VerifiedResult<{ cart: CartLine[]; changed: boolean }>> {
+export async function applyShoppingCartActionVerified(jid: string, action: CartAction, items: CartChange[], effectKey: string,pendingSourceMessageId?:string): Promise<VerifiedResult<{ cart: CartLine[]; changed: boolean }>> {
   try {
     const [[stored]]: any = await pool.execute('SELECT result_json AS resultJson FROM conversation_effects WHERE effect_key=?',[effectKey])
-    if(stored){const value=typeof stored.resultJson==='string'?JSON.parse(stored.resultJson):stored.resultJson;return value.changed?{status:'success',value:{cart:value.cart,changed:true}}:{status:'rejected',message:'No se pudo aplicar el cambio solicitado al carrito.'}}
+    if(stored){const value=typeof stored.resultJson==='string'?JSON.parse(stored.resultJson):stored.resultJson;if(pendingSourceMessageId)await clearPendingIntentBySource(jid,pendingSourceMessageId);return value.changed?{status:'success',value:{cart:value.cart,changed:true}}:{status:'rejected',message:'No se pudo aplicar el cambio solicitado al carrito.'}}
     const before = await getShoppingCart(jid)
-    const cart = await applyShoppingCartAction(jid,action,items,effectKey)
+    const cart = await applyShoppingCartAction(jid,action,items,effectKey,pendingSourceMessageId)
     const changed = action === 'show' || JSON.stringify(before) !== JSON.stringify(cart)
     if (!changed) return { status:'rejected', message:'No se pudo aplicar el cambio solicitado al carrito.' }
     return { status:'success', value:{ cart, changed } }
@@ -171,7 +227,7 @@ export async function getUpcomingAppointments(jid: string): Promise<AppointmentR
   return rows.map((row: any) => ({ ...row, id: Number(row.id) }))
 }
 
-export async function createAppointment(jid: string, startsAt: Date, endsAt: Date, serviceRequested: string | null, effectKey?: string): Promise<{ booked: boolean; appointment?: AppointmentRecord }> {
+export async function createAppointment(jid: string, startsAt: Date, endsAt: Date, serviceRequested: string | null, effectKey?: string,pendingSourceMessageId?:string): Promise<{ booked: boolean; appointment?: AppointmentRecord }> {
   await upsertContactChat(jid)
   const conn = await pool.getConnection()
   let lockAcquired = false
@@ -185,6 +241,7 @@ export async function createAppointment(jid: string, startsAt: Date, endsAt: Dat
       if (stored) {
         const value = typeof stored.resultJson === 'string' ? JSON.parse(stored.resultJson) : stored.resultJson
         if (value.appointment) { value.appointment.startsAt = new Date(value.appointment.startsAt); value.appointment.endsAt = new Date(value.appointment.endsAt) }
+        if(pendingSourceMessageId)await conn.execute('DELETE FROM pending_intents WHERE jid=? AND source_message_id=?',[jid,pendingSourceMessageId])
         await conn.commit()
         return value
       }
@@ -194,13 +251,14 @@ export async function createAppointment(jid: string, startsAt: Date, endsAt: Dat
     const [conflicts]: any = await conn.query(`SELECT id FROM appointments WHERE status='booked' AND starts_at < ? AND ends_at > ? LIMIT 1 FOR UPDATE`, [endsAt, startsAt])
     if (conflicts.length) {
       const result = { booked: false }
-      if (effectKey) { await conn.execute('INSERT INTO conversation_effects (effect_key,effect_type,result_json) VALUES (?,?,?)', [effectKey,'appointment:book',JSON.stringify(result)]);await conn.commit() }
+      if (effectKey) { await conn.execute('INSERT INTO conversation_effects (effect_key,effect_type,result_json) VALUES (?,?,?)', [effectKey,'appointment:book',JSON.stringify(result)]);if(pendingSourceMessageId)await conn.execute('DELETE FROM pending_intents WHERE jid=? AND source_message_id=?',[jid,pendingSourceMessageId]);await conn.commit() }
       else await conn.rollback()
       return result
     }
     const [result]: any = await conn.execute('INSERT INTO appointments (contact_id,starts_at,ends_at,service_requested,status) VALUES (?,?,?,?,\'booked\')', [contact.id, startsAt, endsAt, serviceRequested])
     const booked = { booked: true, appointment: { id: Number(result.insertId), startsAt, endsAt, serviceRequested } }
     if (effectKey) await conn.execute('INSERT INTO conversation_effects (effect_key,effect_type,result_json) VALUES (?,?,?)', [effectKey,'appointment:book',JSON.stringify(booked)])
+    if(pendingSourceMessageId)await conn.execute('DELETE FROM pending_intents WHERE jid=? AND source_message_id=?',[jid,pendingSourceMessageId])
     await conn.commit()
     return booked
   } catch (error) { await conn.rollback(); throw error }
@@ -226,7 +284,7 @@ export async function cancelNextAppointment(jid: string): Promise<AppointmentRec
   } catch (error) { await conn.rollback(); throw error } finally { conn.release() }
 }
 
-export async function cancelAppointmentById(jid: string, appointmentId: number, effectKey: string): Promise<VerifiedResult<AppointmentRecord>> {
+export async function cancelAppointmentById(jid: string, appointmentId: number, effectKey: string,pendingSourceMessageId?:string): Promise<VerifiedResult<AppointmentRecord>> {
   const conn = await pool.getConnection()
   try {
     await conn.beginTransaction()
@@ -234,6 +292,7 @@ export async function cancelAppointmentById(jid: string, appointmentId: number, 
     if (stored) {
       const value = typeof stored.resultJson === 'string' ? JSON.parse(stored.resultJson) : stored.resultJson
       if(value.status==='success'){value.value.startsAt = new Date(value.value.startsAt);value.value.endsAt = new Date(value.value.endsAt)}
+      if(pendingSourceMessageId)await conn.execute('DELETE FROM pending_intents WHERE jid=? AND source_message_id=?',[jid,pendingSourceMessageId])
       await conn.commit();return value
     }
     const [rows]: any = await conn.execute(`SELECT a.id,a.starts_at AS startsAt,a.ends_at AS endsAt,a.service_requested AS serviceRequested
@@ -247,11 +306,12 @@ export async function cancelAppointmentById(jid: string, appointmentId: number, 
       result = { status:'success', value:appointment }
     }
     await conn.execute('INSERT INTO conversation_effects (effect_key,effect_type,result_json) VALUES (?,?,?)', [effectKey,'appointment:cancel',JSON.stringify(result)])
+    if(pendingSourceMessageId)await conn.execute('DELETE FROM pending_intents WHERE jid=? AND source_message_id=?',[jid,pendingSourceMessageId])
     await conn.commit();return result
   } catch (error) { await conn.rollback();throw error } finally { conn.release() }
 }
 
-export async function rescheduleAppointmentForContact(jid: string, appointmentId: number, startsAt: Date, endsAt: Date, effectKey: string): Promise<VerifiedResult<AppointmentRecord>> {
+export async function rescheduleAppointmentForContact(jid: string, appointmentId: number, startsAt: Date, endsAt: Date, effectKey: string,pendingSourceMessageId?:string): Promise<VerifiedResult<AppointmentRecord>> {
   const conn = await pool.getConnection()
   let lockAcquired = false
   try {
@@ -263,6 +323,7 @@ export async function rescheduleAppointmentForContact(jid: string, appointmentId
     if (stored) {
       const value = typeof stored.resultJson === 'string' ? JSON.parse(stored.resultJson) : stored.resultJson
       if (value.value) { value.value.startsAt=new Date(value.value.startsAt);value.value.endsAt=new Date(value.value.endsAt) }
+      if(pendingSourceMessageId)await conn.execute('DELETE FROM pending_intents WHERE jid=? AND source_message_id=?',[jid,pendingSourceMessageId])
       await conn.commit();return value
     }
     const [rows]: any = await conn.execute(`SELECT a.id,a.service_requested AS serviceRequested FROM appointments a JOIN contact_identifiers i ON i.contact_id=a.contact_id
@@ -278,6 +339,7 @@ export async function rescheduleAppointmentForContact(jid: string, appointmentId
       }
     }
     await conn.execute('INSERT INTO conversation_effects (effect_key,effect_type,result_json) VALUES (?,?,?)',[effectKey,'appointment:reschedule',JSON.stringify(result)])
+    if(pendingSourceMessageId)await conn.execute('DELETE FROM pending_intents WHERE jid=? AND source_message_id=?',[jid,pendingSourceMessageId])
     await conn.commit();return result
   } catch(error){await conn.rollback();throw error}
   finally{if(lockAcquired)await conn.query('SELECT RELEASE_LOCK(?)',[`whatsapp-appointment-booking:${config.db.database}`]).catch(()=>undefined);conn.release()}
@@ -359,18 +421,70 @@ export async function listContacts(page = 1, pageSize = 20, search = ''): Promis
 }
 
 export interface ContactProfileInput { customName: string | null; tags: string | null; notes: string | null }
+export interface ContactImportInput extends ContactProfileInput { phoneNumber:string }
 
 export async function createManualContact(phoneNumber: string, profile: ContactProfileInput): Promise<number> {
   const conn = await pool.getConnection()
   try {
     await conn.beginTransaction()
     const jid = `${phoneNumber}@s.whatsapp.net`
+    const [[existing]]:any=await conn.query('SELECT id FROM contacts WHERE phone_number=? FOR UPDATE',[phoneNumber])
+    if(existing){
+      const contactId=Number(existing.id)
+      await conn.execute(`INSERT INTO contact_profiles (contact_id,custom_name,tags,notes) VALUES (?,?,?,?)
+        ON DUPLICATE KEY UPDATE custom_name=COALESCE(VALUES(custom_name),custom_name),tags=COALESCE(VALUES(tags),tags),notes=COALESCE(VALUES(notes),notes)`,[contactId,profile.customName,profile.tags,profile.notes])
+      await conn.commit();return contactId
+    }
     const [result]: any = await conn.execute('INSERT INTO contacts (phone_number,display_name,identity_status) VALUES (?,NULL,\'resolved\')', [phoneNumber])
     await conn.execute('INSERT INTO contact_identifiers (contact_id,jid,identifier_type) VALUES (?, ?, \'pn\')', [result.insertId,jid])
     await conn.execute('INSERT INTO contact_profiles (contact_id,custom_name,tags,notes) VALUES (?,?,?,?)', [result.insertId,profile.customName,profile.tags,profile.notes])
     await conn.commit()
     return Number(result.insertId)
   } catch (error) { await conn.rollback(); throw error } finally { conn.release() }
+}
+
+export async function importManualContacts(inputs:ContactImportInput[]):Promise<{created:number;updated:number;duplicates:number;contactIds:number[]}>{
+  const conn=await pool.getConnection()
+  try{
+    await conn.beginTransaction()
+    const unique=new Map<string,ContactImportInput>()
+    let duplicates=0
+    for(const input of inputs){if(unique.has(input.phoneNumber)){duplicates++;continue}unique.set(input.phoneNumber,input)}
+    let created=0,updated=0;const contactIds:number[]=[]
+    for(const input of unique.values()){
+      const [[existing]]:any=await conn.query('SELECT id FROM contacts WHERE phone_number=? FOR UPDATE',[input.phoneNumber])
+      if(existing){
+        const contactId=Number(existing.id);updated++
+        await conn.execute(`INSERT INTO contact_profiles (contact_id,custom_name,tags,notes) VALUES (?,?,?,?)
+          ON DUPLICATE KEY UPDATE custom_name=COALESCE(VALUES(custom_name),custom_name),tags=COALESCE(VALUES(tags),tags),notes=COALESCE(VALUES(notes),notes)`,[contactId,input.customName,input.tags,input.notes])
+        contactIds.push(contactId);continue
+      }
+      const jid=`${input.phoneNumber}@s.whatsapp.net`
+      const [result]:any=await conn.execute("INSERT INTO contacts (phone_number,display_name,identity_status) VALUES (?,NULL,'resolved')",[input.phoneNumber])
+      await conn.execute("INSERT INTO contact_identifiers (contact_id,jid,identifier_type) VALUES (?,?,'pn')",[result.insertId,jid])
+      await conn.execute('INSERT INTO contact_profiles (contact_id,custom_name,tags,notes) VALUES (?,?,?,?)',[result.insertId,input.customName,input.tags,input.notes])
+      created++;contactIds.push(Number(result.insertId))
+    }
+    await conn.commit();return {created,updated,duplicates,contactIds}
+  }catch(error){await conn.rollback();throw error}finally{conn.release()}
+}
+
+export async function updateContactRecord(contactId:number,phoneNumber:string,profile:ContactProfileInput):Promise<boolean>{
+  const conn=await pool.getConnection()
+  try{
+    await conn.beginTransaction()
+    const [[contact]]:any=await conn.query('SELECT phone_number AS phoneNumber FROM contacts WHERE id=? FOR UPDATE',[contactId])
+    if(!contact){await conn.commit();return false}
+    const [[duplicate]]:any=await conn.query('SELECT id FROM contacts WHERE phone_number=? AND id<>? LIMIT 1 FOR UPDATE',[phoneNumber,contactId])
+    if(duplicate)throw new ConflictError('Ese número ya está asignado a otro contacto.','CONTACT_PHONE_IN_USE')
+    await conn.execute("UPDATE contacts SET phone_number=?,identity_status='resolved' WHERE id=?",[phoneNumber,contactId])
+    if(contact.phoneNumber&&contact.phoneNumber!==phoneNumber){
+      await conn.execute('UPDATE contact_identifiers SET jid=? WHERE contact_id=? AND identifier_type=\'pn\' AND jid=?',[`${phoneNumber}@s.whatsapp.net`,contactId,`${contact.phoneNumber}@s.whatsapp.net`])
+    }
+    await conn.execute(`INSERT INTO contact_profiles (contact_id,custom_name,tags,notes) VALUES (?,?,?,?)
+      ON DUPLICATE KEY UPDATE custom_name=VALUES(custom_name),tags=VALUES(tags),notes=VALUES(notes)`,[contactId,profile.customName,profile.tags,profile.notes])
+    await conn.commit();return true
+  }catch(error){await conn.rollback();throw error}finally{conn.release()}
 }
 
 export async function updateContactProfile(contactId: number, profile: ContactProfileInput): Promise<boolean> {
@@ -415,51 +529,61 @@ export async function listShoppingCarts(): Promise<ShoppingCartSummary[]> {
   return [...carts.values()]
 }
 
-export async function createOrderFromCart(contactId: number): Promise<number> {
-  const conn = await pool.getConnection()
-  try {
-    await conn.beginTransaction()
-    const [[cart]]: any = await conn.query('SELECT id FROM shopping_carts WHERE contact_id=? FOR UPDATE', [contactId])
-    if (!cart) throw new Error('Este contacto no tiene carrito')
-    const [rows]: any = await conn.query('SELECT inventory_item_id,sku,item_type,item_name,quantity,unit_price,currency FROM shopping_cart_items WHERE cart_id=? FOR UPDATE', [cart.id])
-    if (!rows.length) throw new Error('El carrito está vacío')
-    const currencies = new Set(rows.map((row: any) => row.currency))
-    const allPriced = rows.every((row: any) => row.unit_price !== null)
-    const currency = currencies.size === 1 ? rows[0].currency : null
-    const total = allPriced && currency ? rows.reduce((sum: number, row: any) => sum + Number(row.unit_price) * Number(row.quantity), 0).toFixed(2) : null
-    const [orderResult]: any = await conn.execute('INSERT INTO orders (contact_id,status,total,currency) VALUES (?,\'pending\',?,?)', [contactId,total,currency])
-    for (const row of rows) await conn.execute('INSERT INTO order_items (order_id,inventory_item_id,sku,item_type,item_name,quantity,unit_price,currency) VALUES (?,?,?,?,?,?,?,?)', [orderResult.insertId,row.inventory_item_id,row.sku,row.item_type,row.item_name,row.quantity,row.unit_price,row.currency])
-    await conn.query('DELETE FROM shopping_cart_items WHERE cart_id=?', [cart.id])
-    await conn.commit()
-    return Number(orderResult.insertId)
-  } catch (error) { await conn.rollback(); throw error } finally { conn.release() }
+export async function createOrderFromCart(contactId: number,reservationMinutes=15): Promise<number> {
+  return (await orderService.createOrderFromCart(contactId,reservationMinutes)).orderId
+}
+
+export async function createWhatsAppOrderFromCartVerified(jid:string,reservationMinutes:number,expectedCart:CartLine[],effectKey:string,pendingSourceMessageId?:string):Promise<VerifiedResult<OrderResult>>{
+  try{return {status:'success',value:await orderService.createWhatsAppOrderFromCart(jid,reservationMinutes,expectedCart,effectKey,pendingSourceMessageId)}}
+  catch(error){
+    if(error instanceof AppError&&error.expose){
+      if(['INSUFFICIENT_STOCK','ITEM_UNAVAILABLE'].includes(error.code))return {status:'unavailable',message:error.message}
+      if(['CART_EMPTY','CART_CHANGED','CONTACT_NOT_FOUND'].includes(error.code))return {status:'rejected',message:error.message}
+    }
+    return {status:'infrastructure_error',message:'No pude crear el pedido ni confirmar la reserva. Inténtalo nuevamente.'}
+  }
+}
+
+export async function getOrderConversationSummary(jid:string,orderId:number):Promise<{publicId:string;status:string;total:string|null;currency:string|null;expiresAt:Date|null}|null>{
+  const [[row]]:any=await pool.execute(`SELECT o.public_id AS publicId,o.status,o.total,o.currency,o.expires_at AS expiresAt FROM orders o
+    JOIN contact_identifiers i ON i.contact_id=o.contact_id WHERE i.jid=? AND o.id=? LIMIT 1`,[jid,orderId])
+  return row?{publicId:String(row.publicId),status:String(row.status),total:row.total===null?null:String(row.total),currency:row.currency??null,expiresAt:row.expiresAt??null}:null
+}
+
+export async function createPublicMenuOrder(phoneNumber:string,customerName:string|null,items:PublicOrderItemInput[],publicOrderKey:string,accessToken:string,reservationMinutes=15){
+  return orderService.createPublicOrder({phoneNumber,customerName,items,publicOrderKey,accessToken,reservationMinutes})
 }
 
 export async function listOrders(): Promise<any[]> {
-  const [rows]: any = await pool.query(`SELECT o.id AS orderId,o.contact_id AS contactId,o.status,o.total,o.currency,o.created_at AS createdAt,
-      COALESCE(cp.custom_name,c.display_name,CONCAT('Contacto #',c.id)) AS displayName,c.phone_number AS phoneNumber,oi.sku,oi.item_type AS itemType,oi.item_name AS itemName,oi.quantity,oi.unit_price AS unitPrice,oi.currency AS itemCurrency
+  const [rows]: any = await pool.query(`SELECT o.id AS orderId,o.public_id AS publicId,o.contact_id AS contactId,o.status,o.payment_status AS paymentStatus,o.reservation_status AS reservationStatus,o.total,o.currency,o.expires_at AS expiresAt,o.created_at AS createdAt,
+      COALESCE(cp.custom_name,c.display_name,o.customer_name,CONCAT('Contacto #',c.id)) AS displayName,COALESCE(o.customer_phone,c.phone_number) AS phoneNumber,oi.sku,oi.item_type AS itemType,oi.item_name AS itemName,oi.quantity,oi.unit_price AS unitPrice,oi.currency AS itemCurrency
     FROM orders o JOIN contacts c ON c.id=o.contact_id LEFT JOIN contact_profiles cp ON cp.contact_id=c.id LEFT JOIN order_items oi ON oi.order_id=o.id
     ORDER BY o.created_at DESC,oi.id LIMIT 1000`)
   const orders = new Map<number, any>()
   for (const row of rows) {
     const id = Number(row.orderId)
     let order = orders.get(id)
-    if (!order) { order = { id, contactId: Number(row.contactId), status: row.status, total: row.total, currency: row.currency, createdAt: row.createdAt, displayName: row.displayName, phoneNumber: row.phoneNumber, items: [] }; orders.set(id, order) }
+    if (!order) { order = { id, publicId:row.publicId??null,contactId: Number(row.contactId), status: row.status,paymentStatus:row.paymentStatus,reservationStatus:row.reservationStatus,total: row.total, currency: row.currency,expiresAt:row.expiresAt??null,createdAt: row.createdAt, displayName: row.displayName, phoneNumber: row.phoneNumber, items: [] }; orders.set(id, order) }
     if (row.sku) order.items.push({ sku: row.sku, itemType: row.itemType, itemName: row.itemName, quantity: Number(row.quantity), unitPrice: row.unitPrice, currency: row.itemCurrency })
   }
   return [...orders.values()]
 }
 
-export async function listOrdersForContact(jid:string):Promise<Array<{id:number;status:string;total:string|null;currency:string|null}>>{
-  const [rows]:any=await pool.execute(`SELECT o.id,o.status,o.total,o.currency FROM orders o
+export async function listOrdersForContact(jid:string):Promise<Array<{id:number;publicId:string|null;status:string;total:string|null;currency:string|null}>>{
+  const [rows]:any=await pool.execute(`SELECT o.id,o.public_id AS publicId,o.status,o.total,o.currency FROM orders o
     JOIN contact_identifiers i ON i.contact_id=o.contact_id WHERE i.jid=? ORDER BY o.created_at DESC LIMIT 10`,[jid])
   return rows.map((row:any)=>({...row,id:Number(row.id),total:row.total===null?null:String(row.total),currency:row.currency??null}))
 }
 
 export async function setOrderStatus(orderId: number, status: 'confirmed' | 'cancelled'): Promise<boolean> {
-  const [result]: any = await pool.execute('UPDATE orders SET status=? WHERE id=? AND status=\'pending\'', [status,orderId])
-  return result.affectedRows > 0
+  await orderService.transition(orderId,status)
+  return true
 }
+
+export async function transitionOrderStatus(orderId:number,status:OrderStatus){return orderService.transition(orderId,status)}
+export async function expireOrderReservations(batchSize=100,maxBatches=10){return orderService.expireReservations(batchSize,maxBatches)}
+export async function getPublicOrder(publicId:string,accessToken:string){return orderService.getPublicOrder(publicId,accessToken)}
+export async function hasPublicOrderKey(key:string){return orderService.hasPublicOrderKey(key)}
 
 export async function setAppointmentStatus(appointmentId: number, status: 'booked' | 'cancelled'): Promise<boolean> {
   const [result]: any = await pool.execute('UPDATE appointments SET status=? WHERE id=?', [status,appointmentId])
@@ -639,6 +763,9 @@ export async function deleteContactData(contactId: number): Promise<boolean> {
   const conn=await pool.getConnection()
   try{
     await conn.beginTransaction()
+    const [[contact]]:any=await conn.query('SELECT id FROM contacts WHERE id=? FOR UPDATE',[contactId])
+    if(!contact){await conn.commit();return false}
+    await orderService.releasePendingOrdersForContact(conn,contactId)
     const [identifiers]:any=await conn.execute('SELECT jid FROM contact_identifiers WHERE contact_id=? FOR UPDATE',[contactId])
     for(const {jid} of identifiers){
       const [turns]:any=await conn.execute('SELECT id FROM conversation_turns WHERE jid=? FOR UPDATE',[jid])
@@ -831,6 +958,15 @@ export async function upsertContactChat(jid: string, name?: string | null, phone
     await conn.query('INSERT INTO chats (contact_id) VALUES (?) ON DUPLICATE KEY UPDATE contact_id=VALUES(contact_id)', [contactId])
     await conn.commit()
   } catch (error) { await conn.rollback(); throw error } finally { conn.release() }
+}
+
+export async function upsertContactIdentity(input:{jid:string;lid?:string|null;phoneJid?:string|null;name?:string|null}):Promise<void>{
+  const conn=await pool.getConnection()
+  try{
+    await conn.beginTransaction()
+    await identify(conn,{jid:input.jid,lid:input.lid??null,phoneJid:input.phoneJid??null,displayName:input.name??null,waMessageId:`contact:${input.jid}`,fromMe:false,senderJid:null,messageType:'contact',text:null,timestamp:new Date(0),status:null,deleted:false,rawPayload:{}})
+    await conn.commit()
+  }catch(error){await conn.rollback();throw error}finally{conn.release()}
 }
 
 export async function enrichContact(jid: string, name: string): Promise<void> {

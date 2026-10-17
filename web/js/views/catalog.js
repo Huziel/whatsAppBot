@@ -1,6 +1,17 @@
 import { $, api } from '../api.js'
+import { confirmAction, createFormModal, showToast } from '../ui/dialogs.js?v=dialogs-1'
+
+let productModal,serviceModal
 
 export function initializeCatalog(){
+  const productCard=$('itemForm').parentElement
+  productModal=createFormModal(productCard,$('itemFormTitle'))
+  serviceModal=createFormModal($('serviceFormCard'),$('serviceFormTitle'))
+  $('itemCancel').classList.remove('hidden');$('itemCancel').textContent='Cancelar'
+  $('serviceCancel').classList.remove('hidden');$('serviceCancel').textContent='Cancelar'
+  const actions=document.createElement('div');actions.className='mt-4 flex flex-wrap gap-2'
+  for(const [label,handler] of [['Agregar producto',openNewProduct],['Agregar servicio',openNewService]]){const button=document.createElement('button');button.type='button';button.className='btn-primary';button.textContent=label;button.onclick=handler;actions.appendChild(button)}
+  $('view-catalog').querySelector(':scope > div').appendChild(actions)
   $('itemType').value='product'
   $('itemType').closest('div').classList.add('hidden')
   $('itemFormTitle').textContent='Agregar producto'
@@ -24,7 +35,7 @@ async function loadInventory(){
       if(item.imageUrl){
         const img=document.createElement('img');img.src=item.imageUrl;img.className='h-12 w-12 rounded-lg object-cover';img.alt='Imagen de '+item.name;img.loading='lazy';img.referrerPolicy='no-referrer';img.onerror=()=>{img.hidden=true};image.appendChild(img)
       }else image.textContent='—'
-      cell(row,item.itemType==='product'?'Producto':'Servicio');cell(row,item.sku);cell(row,item.name);cell(row,item.price===null?'A cotizar':item.price+' '+item.currency);cell(row,item.itemType==='service'?'—':item.stockQuantity===null?'Sin control':String(item.stockQuantity));cell(row,item.isActive?'Activo':'Inactivo')
+      cell(row,item.itemType==='product'?'Producto':'Servicio');cell(row,item.sku);cell(row,item.name);cell(row,item.price===null?'A cotizar':item.price+' '+item.currency);cell(row,item.itemType==='service'?'—':item.stockQuantity===null?'Sin control':`${item.stockQuantity} físico · ${item.reservedQuantity||0} reservado · ${item.availableQuantity??item.stockQuantity} disponible`);cell(row,item.isActive?'Activo':'Inactivo')
       const action=cell(row,'');action.className='whitespace-nowrap'
       const edit=document.createElement('button');edit.className='btn';edit.textContent='Editar';edit.onclick=()=>editItem(item)
       const remove=document.createElement('button');remove.className='btn-danger ml-1';remove.textContent='Eliminar';remove.onclick=()=>deleteItem(item)
@@ -38,20 +49,23 @@ async function loadInventory(){
 
 function cell(row,value){const td=document.createElement('td');td.textContent=value??'';row.appendChild(td);return td}
 
+function openNewProduct(){resetProductForm();productModal.setTitle('Agregar producto');productModal.open()}
+function openNewService(){resetServiceForm();serviceModal.setTitle('Agregar servicio');serviceModal.open()}
+
 function editItem(item){
   if(item.itemType==='service'){editService(item);return}
   $('itemId').value=item.id;$('itemType').value='product';$('itemSku').value=item.sku;$('itemName').value=item.name;$('itemDescription').value=item.description||'';$('itemImageUrl').value=item.imageUrl||'';$('itemPrice').value=item.price??'';$('itemCurrency').value=item.currency;$('itemStock').value=item.stockQuantity??'';$('itemActive').checked=item.isActive
-  $('itemFormTitle').textContent='Editar producto';$('itemSubmit').textContent='Guardar cambios';$('itemCancel').classList.remove('hidden');$('itemType').dispatchEvent(new Event('change'));$('itemFormTitle').scrollIntoView({behavior:'smooth'})
+  $('itemFormTitle').textContent='Editar producto';$('itemSubmit').textContent='Guardar cambios';$('itemCancel').classList.remove('hidden');$('itemType').dispatchEvent(new Event('change'));productModal.setTitle('Editar producto');productModal.open()
 }
 
 function editService(item){
   $('serviceId').value=item.id;$('serviceSku').value=item.sku;$('serviceName').value=item.name;$('serviceDescription').value=item.description||'';$('serviceImageUrl').value=item.imageUrl||'';$('servicePrice').value=item.price??'';$('serviceCurrency').value=item.currency;$('serviceActive').checked=item.isActive
-  $('serviceFormTitle').textContent='Editar servicio';$('serviceSubmit').textContent='Guardar cambios';$('serviceCancel').classList.remove('hidden');$('serviceNotice').textContent=`Editando ${item.name}`;updateServicePreview();$('serviceFormCard').scrollIntoView({behavior:'smooth'})
+  $('serviceFormTitle').textContent='Editar servicio';$('serviceSubmit').textContent='Guardar cambios';$('serviceCancel').classList.remove('hidden');$('serviceNotice').textContent=`Editando ${item.name}`;updateServicePreview();serviceModal.setTitle('Editar servicio');serviceModal.open()
 }
 
-function resetProductForm(){$('itemForm').reset();$('itemId').value='';$('itemType').value='product';$('itemCurrency').value='MXN';$('itemActive').checked=true;$('itemFormTitle').textContent='Agregar producto';$('itemSubmit').textContent='Guardar producto';$('itemCancel').classList.add('hidden');$('itemType').dispatchEvent(new Event('change'))}
+function resetProductForm(){$('itemForm').reset();$('itemId').value='';$('itemType').value='product';$('itemCurrency').value='MXN';$('itemActive').checked=true;$('itemFormTitle').textContent='Agregar producto';$('itemSubmit').textContent='Guardar producto';$('itemCancel').classList.remove('hidden');$('itemType').dispatchEvent(new Event('change'));productModal.close()}
 
-function resetServiceForm(){$('serviceForm').reset();$('serviceId').value='';$('serviceCurrency').value='MXN';$('serviceActive').checked=true;$('serviceFormTitle').textContent='Dar de alta servicio';$('serviceSubmit').textContent='Guardar servicio';$('serviceCancel').classList.add('hidden');$('serviceNotice').textContent='';updateServicePreview()}
+function resetServiceForm(){$('serviceForm').reset();$('serviceId').value='';$('serviceCurrency').value='MXN';$('serviceActive').checked=true;$('serviceFormTitle').textContent='Dar de alta servicio';$('serviceSubmit').textContent='Guardar servicio';$('serviceCancel').classList.remove('hidden');$('serviceNotice').textContent='';updateServicePreview();serviceModal.close()}
 
 function updateServicePreview(){
   const url=$('serviceImageUrl').value.trim(),preview=$('serviceImagePreview'),placeholder=$('serviceImagePlaceholder')
@@ -65,14 +79,14 @@ async function saveProduct(event){
   event.preventDefault();if(!$('itemForm').reportValidity())return
   const id=$('itemId').value
   const body={itemType:'product',sku:$('itemSku').value,name:$('itemName').value,description:$('itemDescription').value,imageUrl:$('itemImageUrl').value,price:$('itemPrice').value===''?null:Number($('itemPrice').value),currency:$('itemCurrency').value,stockQuantity:$('itemStock').value===''?null:Number($('itemStock').value),isActive:$('itemActive').checked}
-  try{await api(id?'/api/inventory/'+id:'/api/inventory',id?'PUT':'POST',body);resetProductForm();await loadInventory()}catch(error){$('inventoryNotice').textContent=error.message}
+  try{await api(id?'/api/inventory/'+id:'/api/inventory',id?'PUT':'POST',body);resetProductForm();showToast(id?'Producto actualizado.':'Producto agregado.');await loadInventory()}catch(error){$('inventoryNotice').textContent=error.message;showToast(error.message,'error')}
 }
 
 async function saveService(event){
   event.preventDefault();if(!$('serviceForm').reportValidity())return
   const id=$('serviceId').value
   const body={itemType:'service',sku:$('serviceSku').value,name:$('serviceName').value,description:$('serviceDescription').value,imageUrl:$('serviceImageUrl').value,price:$('servicePrice').value===''?null:Number($('servicePrice').value),currency:$('serviceCurrency').value,stockQuantity:null,isActive:$('serviceActive').checked}
-  try{await api(id?'/api/inventory/'+id:'/api/inventory',id?'PUT':'POST',body);resetServiceForm();$('serviceNotice').textContent=id?'Servicio actualizado.':'Servicio agregado al catálogo.';await loadInventory()}catch(error){$('serviceNotice').textContent=error.message}
+  try{await api(id?'/api/inventory/'+id:'/api/inventory',id?'PUT':'POST',body);resetServiceForm();showToast(id?'Servicio actualizado.':'Servicio agregado al catálogo.');await loadInventory()}catch(error){$('serviceNotice').textContent=error.message;showToast(error.message,'error')}
 }
 
-async function deleteItem(item){if(!confirm(`¿Eliminar ${item.name} (${item.sku})?`))return;try{await api('/api/inventory/'+item.id,'DELETE');if(item.itemType==='service'&&String(item.id)===$('serviceId').value)resetServiceForm();if(item.itemType==='product'&&String(item.id)===$('itemId').value)resetProductForm();await loadInventory()}catch(error){$('inventoryNotice').textContent=error.message}}
+async function deleteItem(item){if(!await confirmAction({title:'Eliminar artículo',message:`¿Eliminar ${item.name} (${item.sku})?`,confirmText:'Eliminar',danger:true}))return;try{await api('/api/inventory/'+item.id,'DELETE');if(item.itemType==='service'&&String(item.id)===$('serviceId').value)resetServiceForm();if(item.itemType==='product'&&String(item.id)===$('itemId').value)resetProductForm();showToast('Artículo eliminado.');await loadInventory()}catch(error){$('inventoryNotice').textContent=error.message;showToast(error.message,'error')}}

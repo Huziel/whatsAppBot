@@ -3,13 +3,14 @@ import path from 'node:path'
 import { decryptAppSettings, encryptAppSettings } from '../settings-crypto'
 import { config } from '../config'
 import type { ContactProfileInput, InventoryItemInput } from '../db'
+import { ValidationError } from '../errors'
 
 export interface AppSettings {
   botName: string; businessName: string; autoReply: boolean; responseMode: 'fixed' | 'deepseek'
   responseText: string; replyDelayMs: number; saveToDatabase: boolean; deepseekApiKey: string
   deepseekModel: 'deepseek-flash' | 'deepseek-v4-pro'; aiTone: 'friendly' | 'professional' | 'formal'
   aiResponseLength: 'brief' | 'balanced' | 'detailed'; aiSystemInstructions: string
-  maxRepliesPerHour: number; messageRetentionDays: number
+  maxRepliesPerHour: number; messageRetentionDays: number; orderReservationMinutes:number
   productCatalogImageUrl: string | null; serviceCatalogImageUrl: string | null
   transferEnabled: boolean; transferBankName: string; transferAccountHolder: string
   transferAccountNumber: string; transferClabe: string; transferInstructions: string
@@ -54,6 +55,8 @@ export function validateSettings(input: any, fallbackApiKey = ''): AppSettings {
   if (!Number.isInteger(maxRepliesPerHour) || maxRepliesPerHour < 1 || maxRepliesPerHour > 200) throw new Error('El límite debe ser entre 1 y 200 respuestas por contacto/hora')
   const messageRetentionDays = input.messageRetentionDays ?? 0
   if (!Number.isInteger(messageRetentionDays) || messageRetentionDays < 0 || messageRetentionDays > 3650) throw new Error('La retención debe ser entre 0 y 3650 días')
+  const orderReservationMinutes=input.orderReservationMinutes??15
+  if(!Number.isInteger(orderReservationMinutes)||orderReservationMinutes<5||orderReservationMinutes>1440)throw new Error('La reserva de pedidos debe durar entre 5 y 1440 minutos')
   const enteredApiKey = typeof input.deepseekApiKey === 'string' ? input.deepseekApiKey.trim() : ''
   const deepseekApiKey = input.clearDeepseekApiKey ? '' : enteredApiKey || fallbackApiKey
   if (input.autoReply && responseMode === 'deepseek' && !deepseekApiKey) throw new Error('Configura la API key de DeepSeek antes de iniciar con ese modo')
@@ -91,7 +94,7 @@ export function validateSettings(input: any, fallbackApiKey = ''): AppSettings {
   if (appointmentsEnabled && responseMode !== 'deepseek') throw new Error('Para gestionar citas, selecciona DeepSeek como modo de respuesta')
   return {
     botName, businessName, autoReply: input.autoReply, responseMode, responseText: input.responseText.trim(), replyDelayMs: input.replyDelayMs,
-    saveToDatabase: input.saveToDatabase, deepseekApiKey, deepseekModel, aiTone, aiResponseLength, aiSystemInstructions, maxRepliesPerHour, messageRetentionDays,
+    saveToDatabase: input.saveToDatabase, deepseekApiKey, deepseekModel, aiTone, aiResponseLength, aiSystemInstructions, maxRepliesPerHour, messageRetentionDays, orderReservationMinutes,
     productCatalogImageUrl: validateCatalogUrl(input.productCatalogImageUrl, 'Imagen general de productos'),
     serviceCatalogImageUrl: validateCatalogUrl(input.serviceCatalogImageUrl, 'Imagen general de servicios'),
     transferEnabled, transferBankName, transferAccountHolder, transferAccountNumber, transferClabe, transferInstructions,
@@ -117,7 +120,8 @@ export async function saveAppSettings(input: any, fallback: AppSettings): Promis
   let saved!: AppSettings
   const operation = settingsWrite.then(async () => {
     const current = await loadAppSettings(fallback)
-    saved = validateSettings(input, current.deepseekApiKey)
+    try{saved = validateSettings(input, current.deepseekApiKey)}
+    catch(error:any){throw new ValidationError(error?.message||'Configuración no válida.','INVALID_SETTINGS')}
     await fs.mkdir(path.dirname(settingsPath), { recursive: true })
     const temp = `${settingsPath}.tmp`
     await fs.writeFile(temp, JSON.stringify(encryptAppSettings(saved), null, 2), 'utf8')

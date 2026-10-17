@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { DateTime } from 'luxon'
-import { authorizeCartMutation, classifyCartDirective, classifyConfirmationReply, classifyPaymentIntent, classifyPendingInput, formatInventoryFact, formatVerifiedCart, isPendingIntentCompatible, KeyedSerialExecutor, resolveInventorySelection, safeConversationalReply } from '../src/conversation-flow'
+import { authorizeCartMutation, classifyCartDirective, classifyConfirmationReply, classifyExplicitRequest, classifyPaymentIntent, classifyPendingInput, detectCartAction, detectCheckoutRequest, formatCheckoutConfirmation, formatInventoryFact, formatVerifiedCart, hasCartMutationAlongsideCheckout, inventorySelectionIndex, isInventoryRecommendationQuestion, isPendingIntentCompatible, KeyedSerialExecutor, resolveInventoryQuery, resolveInventorySelection, safeConversationalReply, selectedItemQuantity, wantsToBuySelectedItem } from '../src/conversation-flow'
 import { resolveRelativeAppointmentText } from '../src/appointment-time'
 import { deliverWithStableId } from '../src/outbound-delivery'
 import type { CartLine, InventoryItem } from '../src/db'
@@ -48,6 +48,67 @@ test('nombres similares generan opciones y no una modificación',()=>{
   assert.equal(authorization.result.status,'ambiguous')
   assert.deepEqual(authorization.candidates?.map(item=>item.sku),['CAFE-1','CAFE-2'])
   assert.equal(authorization.quantity,2)
+})
+
+test('selección de inventario acepta referencias naturales y detecta compra del artículo seleccionado',()=>{
+  const one=[{sku:'AUD-1',name:'Audífonos Bluetooth'}]
+  const several=[...one,{sku:'AUD-2',name:'Audífonos con cable'}]
+  assert.equal(inventorySelectionIndex('1',several),0)
+  assert.equal(inventorySelectionIndex('Esos',one),0)
+  assert.equal(inventorySelectionIndex('Los quiero',one),0)
+  assert.equal(inventorySelectionIndex('Esos',several),null)
+  assert.equal(inventorySelectionIndex('la segunda',several),1)
+  assert.equal(wantsToBuySelectedItem('Los quiero'),true)
+  assert.equal(wantsToBuySelectedItem('Esos los quiero'),true)
+  assert.equal(wantsToBuySelectedItem('Esos'),false)
+  assert.equal(wantsToBuySelectedItem('Agrégame dos de esos'),true)
+  assert.equal(wantsToBuySelectedItem('Añádelo'),true)
+  assert.equal(selectedItemQuantity('Quiero dos de esos'),2)
+  assert.equal(selectedItemQuantity('Agrégame dos de esos'),2)
+  assert.equal(selectedItemQuantity('Ese, cantidad 3'),3)
+  assert.equal(selectedItemQuantity('Lo quiero'),1)
+  assert.equal(selectedItemQuantity('Quiero 101 de esos'),null)
+})
+
+test('checkout se distingue del historial y siempre exige confirmación',()=>{
+  for(const text of ['Finalizar compra','Quiero hacer el pedido','Confirmar mi pedido']){
+    assert.equal(detectCheckoutRequest(text),true,text)
+    assert.equal(classifyExplicitRequest(text),'checkout',text)
+  }
+  assert.equal(classifyExplicitRequest('¿Dónde está mi pedido?'),'orders')
+  assert.equal(isInventoryRecommendationQuestion('¿Cuál me recomiendas para videollamadas?'),true)
+  assert.equal(detectCheckoutRequest('No quiero hacer un pedido'),false)
+  assert.equal(detectCheckoutRequest('No voy a finalizar la compra'),false)
+  assert.equal(detectCheckoutRequest('No puedo hacer un pedido'),false)
+  assert.equal(detectCheckoutRequest('Nunca voy a terminar la compra'),false)
+  assert.equal(detectCheckoutRequest('No necesito ayuda, quiero hacer un pedido'),true)
+  assert.equal(detectCheckoutRequest('No agregues nada, solo quiero hacer un pedido'),true)
+  assert.equal(hasCartMutationAlongsideCheckout('Compra Producto A y finaliza pedido'),true)
+  assert.equal(hasCartMutationAlongsideCheckout('Comprar Producto A y finalizar pedido'),true)
+  assert.equal(hasCartMutationAlongsideCheckout('Agregar Producto A y finalizar pedido'),true)
+  assert.equal(hasCartMutationAlongsideCheckout('Quitar Producto A y finalizar pedido'),true)
+  assert.equal(hasCartMutationAlongsideCheckout('Incluyas Producto A y finaliza pedido'),true)
+  assert.equal(hasCartMutationAlongsideCheckout('No agregues nada, solo quiero hacer un pedido'),false)
+  assert.equal(hasCartMutationAlongsideCheckout('Finalizar compra'),false)
+  const pending={kind:'checkout_confirmation' as const,cart, reservationMinutes:15,expiresAt:new Date(Date.now()+60_000).toISOString()}
+  assert.equal(classifyPendingInput(pending,'Sí'),'answer')
+  assert.equal(classifyPendingInput(pending,'Sí, por favor'),'answer')
+  assert.equal(classifyPendingInput(pending,'No'),'cancel')
+  assert.equal(classifyPendingInput(pending,'No, gracias'),'cancel')
+  assert.equal(classifyPendingInput(pending,'Agrega Producto A'),'new_request')
+  assert.equal(classifyPendingInput(pending,'Compra Producto A y finaliza pedido'),'new_request')
+  assert.match(formatCheckoutConfirmation(cart),/¿Confirmas crear el pedido/)
+  assert.match(formatCheckoutConfirmation(cart),/Total: 120\.00 MXN/)
+  assert.match(formatCheckoutConfirmation([]),/carrito está vacío/i)
+})
+
+test('consulta exacta conserva selección y un agotado ofrece alternativas activas',()=>{
+  const exact=resolveInventoryQuery('¿Cuánto cuesta CAFE-1?',inventory)
+  assert.equal(exact.status,'success')
+  assert.deepEqual(exact.selected,{sku:'CAFE-1',name:'Café clásico'})
+  const exhausted=resolveInventoryQuery('¿Tienen TAZA-1?',[...inventory,{id:9,itemType:'product',sku:'TAZA-2',name:'Taza azul',description:null,imageUrl:null,price:'90.00',currency:'MXN',stockQuantity:3,isActive:true}])
+  assert.equal(exhausted.status,'ambiguous')
+  assert.deepEqual(exhausted.candidates,[{sku:'TAZA-2',name:'Taza azul'}])
 })
 
 test('otro igual solo usa contexto inequívoco del mismo carrito',()=>{
@@ -123,7 +184,11 @@ test('afirmación, condición y negación conservan su alcance',()=>{
   assert.equal(classifyCartDirective('Si tienes existencias, ¿cuánto cuesta?','add'),'none')
   assert.notEqual(authorizeCartMutation('Si tienes existencias, ¿cuánto cuesta Producto A?','add',[],inventory,[]).result.status,'success')
   assert.equal(classifyConfirmationReply('Sí'),'affirmative')
+  assert.equal(classifyConfirmationReply('Sí, confirmo'),'affirmative')
+  assert.equal(classifyConfirmationReply('Sí, por favor'),'affirmative')
   assert.equal(classifyConfirmationReply('Si hay existencias'),'other')
+  assert.equal(detectCartAction('¿Qué llevo en el carrito?'),'show')
+  assert.equal(detectCartAction('¿Qué tengo en mi carrito?'),'show')
 })
 
 test('intenciones pendientes distinguen respuesta, corrección y cambio de tema',()=>{
@@ -162,7 +227,7 @@ test('precio y existencias conservan estados autorizados sin inventar',()=>{
 })
 
 test('texto libre del modelo no puede confirmar operaciones críticas',()=>{
-  for(const text of ['Pago recibido y confirmado','Cita agendada','Agregado al carrito','Tu reserva quedó lista','Ya está incluido en tu compra','Cuesta 15 MXN','Tenemos 99 existencias','Recibimos tu transferencia','Hay una promoción 2x1'])assert.notEqual(safeConversationalReply(text),text)
+  for(const text of ['Pago recibido y confirmado','Cita agendada','Agregado al carrito','Tu reserva quedó lista','Ya está incluido en tu compra','Tu pedido está en preparación','Tu pedido sigue pendiente','Tu pedido va en camino','Tu pedido ya salió','Estamos preparando tu pedido','Tu orden está siendo preparada','Tu pedido fue cancelado','Tu pedido está despachado','Tu pedido fue aprobado','Tu pedido está vencido','Cuesta 15 MXN','Tenemos 99 existencias','Recibimos tu transferencia','Hay una promoción 2x1'])assert.notEqual(safeConversationalReply(text),text)
   assert.equal(safeConversationalReply('Hola, ¿en qué puedo ayudarte?'),'Hola, ¿en qué puedo ayudarte?')
 })
 

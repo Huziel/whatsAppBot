@@ -4,7 +4,7 @@ let configured=false
 async function request(path,body){
   const response=await fetch(path,{method:body?'POST':'GET',headers:{'content-type':'application/json'},body:body?JSON.stringify(body):undefined,credentials:'same-origin',signal:AbortSignal.timeout(20_000),cache:'no-store'})
   const payload=await response.json()
-  if(!response.ok)throw new Error(payload.error||'No se pudo completar el acceso.')
+  if(!response.ok)throw new Error(payload?.error?.message||payload?.error||'No se pudo completar el acceso.')
   return payload
 }
 
@@ -13,6 +13,7 @@ async function initialize(){
     const status=await request('/api/auth/status')
     configured=status.configured
     if(status.authenticated){location.replace('/');return}
+    if(new URLSearchParams(location.search).get('expired')==='1')showError('Tu sesión expiró. Inicia sesión nuevamente.')
     if(!configured){
       $('loginTitle').textContent='Crear acceso al dashboard'
       $('loginDescription').textContent='Crea el usuario y una contraseña segura para proteger el panel.'

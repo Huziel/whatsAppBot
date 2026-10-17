@@ -8,7 +8,7 @@ const fallback: AppSettings = {
   responseMode: 'fixed', responseText: 'Respuesta simulada', replyDelayMs: 1500,
   saveToDatabase: true, deepseekApiKey: '', deepseekModel: 'deepseek-flash',
   aiTone: 'professional', aiResponseLength: 'brief', aiSystemInstructions: '',
-  maxRepliesPerHour: 20, messageRetentionDays: 0, productCatalogImageUrl: null,
+  maxRepliesPerHour: 20, messageRetentionDays: 0, orderReservationMinutes:15,productCatalogImageUrl: null,
   serviceCatalogImageUrl: null, transferEnabled: false, transferBankName: '',
   transferAccountHolder: '', transferAccountNumber: '', transferClabe: '', transferInstructions: '',
   appointmentsEnabled: false, appointmentTimeZone: 'America/Mexico_City', appointmentDays: [1,2,3,4,5],

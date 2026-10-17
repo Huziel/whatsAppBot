@@ -213,8 +213,10 @@ test('valida instrucciones, límite por contacto y retención de mensajes', () =
   assert.equal(valid.aiSystemInstructions, 'Responde formalmente')
   assert.equal(valid.maxRepliesPerHour, 12)
   assert.equal(valid.messageRetentionDays, 30)
+  assert.equal(valid.orderReservationMinutes,15)
   assert.throws(() => validateSettings({ ...settings, maxRepliesPerHour: 0 }), /1 y 200/)
   assert.throws(() => validateSettings({ ...settings, messageRetentionDays: 4000 }), /retención/)
+  assert.throws(() => validateSettings({ ...settings, orderReservationMinutes: 2 }), /reserva de pedidos/)
   const identity = validateSettings({ ...settings, botName: 'Nora', businessName: 'Café Demo' })
   assert.equal(identity.botName, 'Nora')
   assert.equal(identity.businessName, 'Café Demo')
@@ -272,6 +274,57 @@ test('dashboard conserva destinos de navegación y campos opcionales accesibles'
   assert.match(conversations,/Reanudar IA/)
   assert.match(conversations,/Pausar IA/)
   assert.match(html, /aria-label="Abrir navegación"/)
+})
+
+test('checkout público conserva el intento y consulta pedidos con token', async()=>{
+  const menu=await fs.readFile(path.resolve('web/js/public-menu.js'),'utf8')
+  const status=await fs.readFile(path.resolve('web/js/public-order.js'),'utf8')
+  const statusPage=await fs.readFile(path.resolve('web/pedido.html'),'utf8')
+  assert.match(menu,/sessionStorage/)
+  assert.match(menu,/submittedPayload/)
+  assert.match(menu,/const definitive=\[400,409\]/)
+  assert.match(menu,/async function loadCatalog/)
+  assert.match(menu,/setCheckoutLocked\(true\)/)
+  assert.match(menu,/result\.publicId/)
+  assert.doesNotMatch(menu,/result\.orderId/)
+  assert.match(status,/authorization:`Bearer \$\{token\}`/)
+  assert.match(statusPage,/id="orderDetail"/)
+})
+
+test('CRM permite importación masiva, editar teléfonos y abrir WhatsApp',async()=>{
+  const contacts=await fs.readFile(path.resolve('web/js/views/contacts.js'),'utf8')
+  assert.match(contacts,/\/api\/contacts\/import/)
+  assert.match(contacts,/\/profile/)
+  assert.match(contacts,/https:\/\/wa\.me\//)
+  assert.match(contacts,/Cargar CSV o TXT/)
+})
+
+test('formularios CRUD y acciones destructivas usan modales accesibles',async()=>{
+  const dialogs=await fs.readFile(path.resolve('web/js/ui/dialogs.js'),'utf8')
+  const contacts=await fs.readFile(path.resolve('web/js/views/contacts.js'),'utf8')
+  const catalog=await fs.readFile(path.resolve('web/js/views/catalog.js'),'utf8')
+  const appointments=await fs.readFile(path.resolve('web/js/views/appointments.js'),'utf8')
+  const settings=await fs.readFile(path.resolve('web/js/views/settings.js'),'utf8')
+  assert.match(dialogs,/dialog\.showModal\(\)/)
+  assert.match(dialogs,/aria-labelledby/)
+  assert.match(contacts,/createFormModal/)
+  assert.match(catalog,/createFormModal/)
+  assert.match(appointments,/promptAction/)
+  assert.match(settings,/promptAction/)
+  for(const file of [contacts,catalog,appointments,settings])assert.doesNotMatch(file,/\b(?:window\.)?(?:confirm|prompt)\s*\(/)
+})
+
+test('un 401 del dashboard comprueba sesión y usa ruta explícita de login',async()=>{
+  const api=await fs.readFile(path.resolve('web/js/api.js'),'utf8')
+  assert.match(api,/api\/auth\/status/)
+  assert.match(api,/\/login\.html\?expired=1/)
+  assert.match(api,/authenticated\?'La solicitud fue rechazada/)
+})
+
+test('el bot registra errores de infraestructura y valida migración transaccional antes de iniciar',async()=>{
+  const index=await fs.readFile(path.resolve('src/index.ts'),'utf8')
+  assert.match(index,/await assertPublicOrderSchema\(\)/)
+  assert.match(index,/logger\.error\(\{err:error,turnId:turn\.id,waMessageId:messageId\}/)
 })
 
 test('valida inventario y fuerza existencias nulas en servicios', () => {

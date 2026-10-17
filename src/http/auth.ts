@@ -3,6 +3,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { promisify } from 'node:util'
 import { IncomingMessage, ServerResponse } from 'node:http'
+import { AuthenticationError, ConflictError, RateLimitError, ValidationError } from '../errors'
 
 const scrypt=promisify(scryptCallback)
 const COOKIE_NAME='wa_dashboard_session'
@@ -38,7 +39,7 @@ export class DashboardAuth {
   authenticated(request:IncomingMessage):boolean{return !!this.sessionFor(request)}
 
   async setup(username:string,password:string,response:ServerResponse):Promise<void>{
-    if(this.record)throw new Error('El acceso ya está configurado. Inicia sesión.')
+    if(this.record)throw new ConflictError('El acceso ya está configurado. Inicia sesión.','AUTH_ALREADY_CONFIGURED')
     const normalized=validateCredentials(username,password)
     const salt=randomBytes(16)
     const hash=await scrypt(normalized.password,salt,PASSWORD_BYTES) as Buffer
@@ -51,8 +52,8 @@ export class DashboardAuth {
   async login(username:string,password:string,request:IncomingMessage,response:ServerResponse):Promise<void>{
     const key=request.socket.remoteAddress??'loopback'
     const failures=this.failures.get(key)
-    if(failures&&failures.blockedUntil>this.now())throw new Error('Demasiados intentos. Espera un minuto y vuelve a intentar.')
-    if(!this.record)throw new Error('El acceso todavía no está configurado. Recarga la página.')
+    if(failures&&failures.blockedUntil>this.now())throw new RateLimitError('Demasiados intentos. Espera un minuto y vuelve a intentar.','LOGIN_RATE_LIMITED')
+    if(!this.record)throw new AuthenticationError('El acceso todavía no está configurado. Recarga la página.','AUTH_NOT_CONFIGURED')
     const inputUsername=String(username??'').trim().toLocaleLowerCase('es')
     const inputPassword=String(password??'')
     const candidate=await scrypt(inputPassword,Buffer.from(this.record.salt,'hex'),PASSWORD_BYTES) as Buffer
@@ -62,7 +63,8 @@ export class DashboardAuth {
     if(!usernameMatches||!passwordMatches){
       const count=(failures?.count??0)+1
       this.failures.set(key,{count,blockedUntil:count>=5?this.now()+60_000:0})
-      throw new Error(count>=5?'Demasiados intentos. Espera un minuto y vuelve a intentar.':'Usuario o contraseña incorrectos.')
+      if(count>=5)throw new RateLimitError('Demasiados intentos. Espera un minuto y vuelve a intentar.','LOGIN_RATE_LIMITED')
+      throw new AuthenticationError('Usuario o contraseña incorrectos.','INVALID_CREDENTIALS')
     }
     this.failures.delete(key)
     this.createSession(response)
@@ -110,7 +112,7 @@ export class DashboardAuth {
 function validateCredentials(username:string,password:string):{username:string;password:string}{
   const normalized=String(username??'').trim()
   const secret=String(password??'')
-  if(normalized.length<3||normalized.length>64||!/^[\p{L}\p{N}._@+-]+$/u.test(normalized))throw new Error('El usuario debe tener entre 3 y 64 caracteres válidos.')
-  if(secret.length<12||Buffer.byteLength(secret,'utf8')>1024)throw new Error('La contraseña debe tener al menos 12 caracteres.')
+  if(normalized.length<3||normalized.length>64||!/^[\p{L}\p{N}._@+-]+$/u.test(normalized))throw new ValidationError('El usuario debe tener entre 3 y 64 caracteres válidos.','INVALID_USERNAME')
+  if(secret.length<12||Buffer.byteLength(secret,'utf8')>1024)throw new ValidationError('La contraseña debe tener al menos 12 caracteres.','INVALID_PASSWORD')
   return {username:normalized,password:secret}
 }

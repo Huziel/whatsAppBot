@@ -2,6 +2,7 @@ import { listAppointments, rescheduleAppointment, setAppointmentStatus } from '.
 import { resolveAppointmentStart } from '../../appointment-time'
 import { AppSettings, loadAppSettings } from '../../ui/settings'
 import { ApiContext, readJson, sendJson } from '../shared'
+import { ValidationError } from '../../errors'
 
 export async function handleAppointmentRoute({ request, response, url }: ApiContext, fallback: AppSettings): Promise<boolean> {
   if (request.method === 'GET' && url.pathname === '/api/appointments') { sendJson(response,200,await listAppointments());return true }
@@ -14,10 +15,12 @@ export async function handleAppointmentRoute({ request, response, url }: ApiCont
   }
   if(body.action==='reschedule'&&typeof body.localStart==='string'){
     const settings=await loadAppSettings(fallback)
-    const localStart=resolveAppointmentStart(body.localStart,{timeZone:settings.appointmentTimeZone,days:settings.appointmentDays,startTime:settings.appointmentStartTime,endTime:settings.appointmentEndTime,durationMinutes:settings.appointmentDurationMinutes})
+    let localStart
+    try{localStart=resolveAppointmentStart(body.localStart,{timeZone:settings.appointmentTimeZone,days:settings.appointmentDays,startTime:settings.appointmentStartTime,endTime:settings.appointmentEndTime,durationMinutes:settings.appointmentDurationMinutes})}
+    catch(error:any){throw new ValidationError(error?.message||'Fecha de cita no válida.','INVALID_APPOINTMENT_TIME')}
     const start=localStart.toUTC().toJSDate(),end=localStart.plus({minutes:settings.appointmentDurationMinutes}).toUTC().toJSDate()
     const changed=await rescheduleAppointment(id,start,end)
     sendJson(response,changed?200:409,changed?{message:'Cita reprogramada'}:{error:'El horario está ocupado o la cita ya no está activa'});return true
   }
-  throw new Error('Acción de cita no válida')
+  throw new ValidationError('Acción de cita no válida.','INVALID_APPOINTMENT_ACTION')
 }

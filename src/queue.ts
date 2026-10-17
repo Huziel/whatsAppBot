@@ -44,7 +44,7 @@ export class PersistentQueue {
             if (op.kind === 'message') await db.persistMessage(op.data)
             else if (op.kind === 'delete') await db.persistDeletion(op.data.jid, op.data.id, op.data.fromMe)
             else if (op.kind === 'status') await db.updateStatus(op.data.jid, op.data.id, op.data.fromMe, op.data.status)
-            else if (op.kind === 'contact') await db.enrichContact(op.data.jid, op.data.name)
+            else if (op.kind === 'contact') await db.upsertContactIdentity(op.data)
             else await db.upsertContactChat(op.data.jid, op.data.name, op.data.phoneJid)
             success = true; break
           } catch (error) {
